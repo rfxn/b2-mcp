@@ -895,6 +895,45 @@ describe("S3 object tools with deterministic handler fake", () => {
     }
   });
 
+  posixIt("rechecks the file root after creating directories through a symlink", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-race-root-"));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-race-out-"));
+    const escapeDir = path.join(outside, "escaped");
+    // Dangling while the path is vetted, then pointed at a real directory
+    // outside the root before the save creates its parents.
+    fs.symlinkSync(escapeDir, path.join(root, "link"));
+    const target = path.join(root, "link", "sub", "out.txt");
+    const racingGuard: B2S3VersionGuard = {
+      ...versionGuard,
+      async resolveS3FileVersion() {
+        fs.mkdirSync(escapeDir);
+        return fileVersion();
+      },
+    };
+    const sandboxed = new ToolHarness();
+    registerS3ObjectTools(sandboxed, s3.asPeerClient(), racingGuard, {
+      ...testConfig,
+      fileRoot: root,
+    });
+
+    try {
+      const result = await sandboxed.call("s3_get_object", {
+        bucket: "b",
+        key: "hello.txt",
+        versionId: "version-hello",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBe(true);
+      expectBadRequestToolError(result, /outside the allowed directory/i);
+      expect(s3.requestsFor("getObject")).toHaveLength(0);
+      expect(fs.readdirSync(escapeDir)).toEqual([]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
   nonRootPosixIt("rejects a non-writable directory before fetching the object", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-ro-dir-"));
     const target = path.join(dir, "writable.txt");

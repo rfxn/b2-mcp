@@ -16,7 +16,7 @@ import { currentMcpRequestSignal } from "../request-context.js";
 import { withS3Circuit, withS3LongCircuit } from "../utils/circuit-breaker.js";
 import { checkDestructive } from "../utils/destructive-gate.js";
 import { badRequestError, codedError, toolError, toolJson, toolSuccess } from "../utils/errors.js";
-import { resolveLocalPath } from "../utils/fs-guard.js";
+import { FileAccessError, resolveLocalPath } from "../utils/fs-guard.js";
 import { logger } from "../utils/logger.js";
 import { timeoutError } from "../utils/named-error.js";
 import type { B2Config, B2S3FileVersionBinding, B2S3VersionGuard } from "../utils/types.js";
@@ -319,6 +319,7 @@ async function removeCreatedDirs(dir: string, firstCreated: string | undefined):
 async function downloadToPath(
   target: SaveToPathTarget,
   fetchObject: () => Promise<B2S3DownloadedObject>,
+  recheckDir?: (dir: string) => void,
 ): Promise<number> {
   const dir = path.dirname(target.path);
   // At most 64 UTF-8 bytes of the name plus the 24-byte suffix keeps the temp
@@ -331,12 +332,17 @@ async function downloadToPath(
   let handle: fs.promises.FileHandle;
   try {
     firstCreatedDir = await fs.promises.mkdir(dir, { recursive: true });
+    // Re-apply the sandbox check to the now-existing directory: a symlinked
+    // ancestor that was dangling when the path was vetted may have been given a
+    // target outside the root since, and mkdir would then have followed it.
+    recheckDir?.(dir);
     // "wx" is O_CREAT|O_EXCL: never follows or reuses an existing path. Creating
     // with the replaced file's bits (umask only narrows them) keeps private
     // contents from ever being more readable than the file they replace.
     handle = await fs.promises.open(tempPath, "wx", target.existing?.mode ?? 0o666);
   } catch (err) {
     await removeCreatedDirs(dir, firstCreatedDir);
+    if (err instanceof FileAccessError) throw badRequestError(err.message);
     throw notWritableError(err, `directory '${dir}'`);
   }
 
@@ -822,7 +828,11 @@ export function registerS3ObjectTools(
 
         // Stream straight to disk for saveToPath — no full-object buffering.
         if (saveTarget) {
-          const bytes = await downloadToPath(saveTarget, getObject);
+          const bytes = await downloadToPath(
+            saveTarget,
+            getObject,
+            config.fileRoot ? (dir) => resolveLocalPath(config, dir, "write") : undefined,
+          );
           return toolSuccess(`Object saved to ${saveTarget.path} (${bytes} bytes)`);
         }
 
