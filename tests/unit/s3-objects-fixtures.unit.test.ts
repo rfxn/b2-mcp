@@ -1309,32 +1309,41 @@ describe("S3 object tools with deterministic handler fake", () => {
     );
   }
 
-  it("keeps the temp file open until it is renamed into place", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-held-"));
-    const target = path.join(dir, "out.txt");
-    fs.writeFileSync(target, "OLD\n");
-    const opened = trackOpenedHandles();
-    const realRename = fs.promises.rename.bind(fs.promises);
-    let heldAtRename: boolean | undefined;
-    const renameSpy = vi.spyOn(fs.promises, "rename").mockImplementation(async (from, to) => {
-      const temp = opened.handles[opened.paths.findIndex((name) => name.endsWith(".part"))];
-      heldAtRename = temp !== undefined && temp.fd !== -1;
-      return realRename(from, to);
+  for (const op of ["rename", "unlink"] as const) {
+    it(`keeps the temp file open until it is ${op === "rename" ? "renamed" : "removed"}`, async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-held-"));
+      const target = path.join(dir, "out.txt");
+      fs.writeFileSync(target, "OLD\n");
+      const opened = trackOpenedHandles();
+      let heldAtOp: boolean | undefined;
+      const real = fs.promises[op].bind(fs.promises) as (...args: string[]) => Promise<void>;
+      const opSpy = vi.spyOn(fs.promises, op as "rename").mockImplementation(async (...args) => {
+        const temp = opened.handles[opened.paths.findIndex((name) => name.endsWith(".part"))];
+        heldAtOp = temp !== undefined && temp.fd !== -1;
+        return real(...(args as string[]));
+      });
+      // A body short of its length makes the save fail and remove its temp file.
+      s3.respond("getObject", () =>
+        downloadedObject({
+          contentLength: op === "rename" ? 3 : 10,
+          body: streamFrom([new TextEncoder().encode("NEW")]),
+        }),
+      );
+
+      try {
+        const result = await saveTo(target);
+
+        expect(Boolean(result.isError)).toBe(op === "unlink");
+        expect(heldAtOp).toBe(true);
+        expect(opened.handles.every((handle) => handle.fd === -1)).toBe(true);
+        expect(fs.readdirSync(dir)).toEqual(["out.txt"]);
+      } finally {
+        opSpy.mockRestore();
+        opened.restore();
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
     });
-    queueWebBody("NEW");
-
-    try {
-      const result = await saveTo(target);
-
-      expect(result.isError).toBeFalsy();
-      expect(heldAtRename).toBe(true);
-      expect(opened.handles.every((handle) => handle.fd === -1)).toBe(true);
-    } finally {
-      renameSpy.mockRestore();
-      opened.restore();
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
+  }
 
   const destinationChanges = [
     {

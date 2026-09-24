@@ -588,16 +588,17 @@ async function downloadToPath(
     if (err instanceof FileAccessError) throw badRequestError(err.message);
     throw err;
   } finally {
-    writeStream?.destroy();
-    await handle.close().catch(() => undefined);
+    // Before destroy(), which closes the handle: an open temp file keeps its identity.
     if (!committed) {
       const temp = anchor ? atDirFd(anchor.handle.fd, tempName) : tempPath;
       const entry = await fs.promises.lstat(temp).catch(() => undefined);
       if (entry && entry.dev === tempId?.dev && entry.ino === tempId.ino) {
         await fs.promises.unlink(temp).catch(() => undefined);
       }
-      if (cleanupIsSafe) await removeCreatedDirs(createdDirs, anchor, sandbox);
     }
+    writeStream?.destroy();
+    await handle.close().catch(() => undefined);
+    if (!committed && cleanupIsSafe) await removeCreatedDirs(createdDirs, anchor, sandbox);
     await anchor?.handle.close().catch(() => undefined);
   }
 }
