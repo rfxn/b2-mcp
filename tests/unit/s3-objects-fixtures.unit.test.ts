@@ -560,6 +560,7 @@ describe("S3 object tools with deterministic handler fake", () => {
   }
 
   const posixIt = process.platform === "win32" ? it.skip : it;
+  const linuxIt = process.platform === "linux" ? it : it.skip;
   const nonRootPosixIt = process.platform === "win32" || process.getuid?.() === 0 ? it.skip : it;
   const rootPosixIt = process.platform !== "win32" && process.getuid?.() === 0 ? it : it.skip;
 
@@ -695,8 +696,9 @@ describe("S3 object tools with deterministic handler fake", () => {
 
       expect(result.isError).toBe(true);
       expect(parseResult(result)).toMatch(/readable body/i);
-      expect(opened.handles).toHaveLength(1);
-      expect(opened.handles[0]?.fd).toBe(-1);
+      // The temp file plus every directory pinned for the rename and the cleanup.
+      expect(opened.paths.some((opened) => opened.endsWith(".part"))).toBe(true);
+      expect(opened.handles.map((handle) => handle.fd)).toEqual(opened.handles.map(() => -1));
       expect(fs.readdirSync(dir)).toEqual([]);
     } finally {
       opened.restore();
@@ -802,8 +804,8 @@ describe("S3 object tools with deterministic handler fake", () => {
 
       expect(result.isError).toBe(true);
       expect(body.destroyed).toBe(true);
-      expect(opened.handles).toHaveLength(1);
-      expect(opened.handles[0]?.fd).toBe(-1);
+      expect(opened.paths.some((opened) => opened.endsWith(".part"))).toBe(true);
+      expect(opened.handles.map((handle) => handle.fd)).toEqual(opened.handles.map(() => -1));
       expect(fs.readFileSync(target, "utf8")).toBe("KEEP\n");
       expect(fs.readdirSync(dir)).toEqual(["out.txt"]);
     } finally {
@@ -1131,6 +1133,530 @@ describe("S3 object tools with deterministic handler fake", () => {
       opened.restore();
       fs.rmSync(root, { recursive: true, force: true });
       fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  // The parent directory is pinned once the temp file in it is confirmed, so the
+  // operations that follow resolve from that inode instead of the path. Linux only:
+  // the pin is reached through /proc/self/fd.
+  linuxIt("renames into the pinned directory after an ancestor is swapped away", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-root-"));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-out-"));
+    const dir = path.join(root, "sub");
+    fs.mkdirSync(dir);
+    const victim = path.join(outside, "out.txt");
+    fs.writeFileSync(victim, "VICTIM\n");
+    const target = path.join(dir, "out.txt");
+    const sandboxed = new ToolHarness();
+    registerS3ObjectTools(sandboxed, s3.asPeerClient(), versionGuard, {
+      ...testConfig,
+      fileRoot: root,
+    });
+    // Swapped while the body is in flight, after the temp file is open and pinned.
+    s3.respond("getObject", () => {
+      fs.renameSync(dir, `${dir}.stash`);
+      fs.symlinkSync(outside, dir);
+      return downloadedObject({
+        contentLength: 3,
+        body: streamFrom([new TextEncoder().encode("NEW")]),
+      });
+    });
+
+    try {
+      const result = await sandboxed.call("s3_get_object", {
+        bucket: "b",
+        key: "hello.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(fs.readFileSync(victim, "utf8")).toBe("VICTIM\n");
+      expect(fs.readdirSync(outside)).toEqual(["out.txt"]);
+      expect(fs.readFileSync(path.join(`${dir}.stash`, "out.txt"), "utf8")).toBe("NEW");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  linuxIt(
+    "keeps a directory outside the root when cleanup follows a swapped ancestor",
+    async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-clean-root-"));
+      const outside = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-clean-out-"));
+      const shared = path.join(root, "shared");
+      fs.mkdirSync(shared);
+      // An empty directory outside the root, of the kind a failed cleanup would remove.
+      const bystander = path.join(outside, "lock");
+      fs.mkdirSync(bystander);
+      const target = path.join(shared, "x", "lock", "out.txt");
+      const sandboxed = new ToolHarness();
+      registerS3ObjectTools(sandboxed, s3.asPeerClient(), versionGuard, {
+        ...testConfig,
+        fileRoot: root,
+      });
+      s3.respond("getObject", () => {
+        fs.renameSync(path.join(shared, "x"), path.join(shared, "x.stash"));
+        fs.symlinkSync(outside, path.join(shared, "x"));
+        throw notFound();
+      });
+
+      try {
+        const result = await sandboxed.call("s3_get_object", {
+          bucket: "b",
+          key: "missing.txt",
+          saveToPath: target,
+        });
+
+        expect(result.isError).toBe(true);
+        expect(fs.existsSync(bystander)).toBe(true);
+        expect(fs.readdirSync(outside)).toEqual(["lock"]);
+        // The levels this download really created are gone.
+        expect(fs.readdirSync(path.join(shared, "x.stash"))).toEqual([]);
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+        fs.rmSync(outside, { recursive: true, force: true });
+      }
+    },
+  );
+
+  // The path-based fallback removes a level only while it is still the inode that was
+  // created, which leaves a window between that check and the removal. Here the check
+  // is made to pass after the swap, so only the pin can still aim the rmdir correctly.
+  linuxIt("removes only the pinned levels when the inode check is defeated", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-race-root-"));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-race-out-"));
+    const shared = path.join(root, "shared");
+    fs.mkdirSync(shared);
+    const bystander = path.join(outside, "lock");
+    fs.mkdirSync(bystander);
+    const swapped = path.join(shared, "x");
+    const stashed = `${swapped}.stash`;
+    const target = path.join(swapped, "lock", "out.txt");
+    const realLstat = fs.promises.lstat.bind(fs.promises);
+    const lstatSpy = vi.spyOn(fs.promises, "lstat").mockImplementation(async (queried) => {
+      const asked = String(queried);
+      // Only once the swap has happened, and only for the created levels.
+      if (fs.existsSync(stashed) && asked.startsWith(swapped)) {
+        return realLstat(asked.replace(swapped, stashed));
+      }
+      return realLstat(queried as Parameters<typeof realLstat>[0]);
+    });
+    const sandboxed = new ToolHarness();
+    registerS3ObjectTools(sandboxed, s3.asPeerClient(), versionGuard, {
+      ...testConfig,
+      fileRoot: root,
+    });
+    s3.respond("getObject", () => {
+      fs.renameSync(swapped, stashed);
+      fs.symlinkSync(outside, swapped);
+      throw notFound();
+    });
+
+    try {
+      const result = await sandboxed.call("s3_get_object", {
+        bucket: "b",
+        key: "missing.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBe(true);
+      expect(fs.existsSync(bystander)).toBe(true);
+      expect(fs.readdirSync(path.join(stashed))).toEqual([]);
+    } finally {
+      lstatSpy.mockRestore();
+      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  // Swapped in the window between opening the temp file and pinning its directory, so
+  // only the pin's own inode check can notice; without it the cleanup walk would start
+  // from a directory outside and remove the like-named one next to it.
+  linuxIt("refuses a parent directory that no longer holds the temp file", async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-swap-"));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-swap-out-"));
+    const bystander = path.join(outside, "lock");
+    fs.mkdirSync(bystander);
+    const dir = path.join(base, "shared", "lock");
+    fs.mkdirSync(path.join(base, "shared"));
+    const target = path.join(dir, "out.txt");
+    const realOpen = fs.promises.open.bind(fs.promises);
+    const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
+      const handle = await realOpen(...(args as Parameters<typeof realOpen>));
+      if (String(args[0]).endsWith(".part")) {
+        fs.renameSync(dir, `${dir}.stash`);
+        fs.symlinkSync(bystander, dir);
+      }
+      return handle;
+    });
+    queueWebBody("NEW");
+
+    try {
+      const result = await tools.call("s3_get_object", {
+        bucket: "b",
+        key: "hello.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBe(true);
+      expectBadRequestToolError(result, /changed while the download was being prepared/i);
+      expect(fs.existsSync(bystander)).toBe(true);
+      expect(fs.readdirSync(outside)).toEqual(["lock"]);
+    } finally {
+      openSpy.mockRestore();
+      fs.rmSync(base, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  // A hard link to the temp file placed outside the root makes the pin's inode check
+  // pass on a directory that is not inside it, so the pin is checked against the root
+  // as well; otherwise the rename would put the fetched bytes outside.
+  linuxIt("refuses a pinned directory outside the file root", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-link-root-"));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-link-out-"));
+    const dir = path.join(root, "sub");
+    fs.mkdirSync(dir);
+    const target = path.join(dir, "out.txt");
+    fs.writeFileSync(target, "OLD\n");
+    fs.chmodSync(target, 0o666);
+    const sandboxed = new ToolHarness();
+    registerS3ObjectTools(sandboxed, s3.asPeerClient(), versionGuard, {
+      ...testConfig,
+      fileRoot: root,
+    });
+    const realOpen = fs.promises.open.bind(fs.promises);
+    const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
+      const handle = await realOpen(...(args as Parameters<typeof realOpen>));
+      const opened = String(args[0]);
+      if (opened.endsWith(".part")) {
+        fs.linkSync(opened, path.join(outside, path.basename(opened)));
+        fs.renameSync(dir, `${dir}.stash`);
+        fs.symlinkSync(outside, dir);
+      }
+      return handle;
+    });
+    queueWebBody("NEW");
+
+    try {
+      const result = await sandboxed.call("s3_get_object", {
+        bucket: "b",
+        key: "hello.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBe(true);
+      expectBadRequestToolError(result, /outside the allowed directory/i);
+      expect(fs.existsSync(path.join(outside, "out.txt"))).toBe(false);
+    } finally {
+      openSpy.mockRestore();
+      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  // A descriptor keeps following its directory after a move, so a pin taken inside the
+  // root can end up outside it while the body is in flight.
+  linuxIt("refuses to commit into a pinned directory moved out of the root", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-move-root-"));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-move-out-"));
+    const dir = path.join(root, "sub");
+    fs.mkdirSync(dir);
+    const target = path.join(dir, "out.txt");
+    const sandboxed = new ToolHarness();
+    registerS3ObjectTools(sandboxed, s3.asPeerClient(), versionGuard, {
+      ...testConfig,
+      fileRoot: root,
+    });
+    s3.respond("getObject", () => {
+      fs.renameSync(dir, path.join(outside, "sub"));
+      return downloadedObject({
+        contentLength: 3,
+        body: streamFrom([new TextEncoder().encode("NEW")]),
+      });
+    });
+
+    try {
+      const result = await sandboxed.call("s3_get_object", {
+        bucket: "b",
+        key: "hello.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBe(true);
+      expectBadRequestToolError(result, /outside the allowed directory/i);
+      expect(fs.existsSync(path.join(outside, "sub", "out.txt"))).toBe(false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  linuxIt("does not remove a created directory that was moved out of the root", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-away-root-"));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-away-out-"));
+    const shared = path.join(root, "shared");
+    fs.mkdirSync(shared);
+    const level = path.join(shared, "x");
+    const target = path.join(level, "out.txt");
+    const sandboxed = new ToolHarness();
+    registerS3ObjectTools(sandboxed, s3.asPeerClient(), versionGuard, {
+      ...testConfig,
+      fileRoot: root,
+    });
+    s3.respond("getObject", () => {
+      fs.renameSync(level, path.join(outside, "x"));
+      throw notFound();
+    });
+
+    try {
+      const result = await sandboxed.call("s3_get_object", {
+        bucket: "b",
+        key: "missing.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBe(true);
+      // Still this download's own directory, but no longer somewhere it may act.
+      expect(fs.existsSync(path.join(outside, "x"))).toBe(true);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  linuxIt("leaves an empty same-named directory left in place of one it created", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-decoy-"));
+    const shared = path.join(root, "shared");
+    fs.mkdirSync(shared);
+    const level = path.join(shared, "x");
+    const target = path.join(level, "out.txt");
+    const sandboxed = new ToolHarness();
+    registerS3ObjectTools(sandboxed, s3.asPeerClient(), versionGuard, {
+      ...testConfig,
+      fileRoot: root,
+    });
+    // The created level is moved aside and an empty decoy left under its name, so only
+    // an inode check can tell that the name no longer holds what this download made.
+    s3.respond("getObject", () => {
+      fs.renameSync(level, `${level}.moved`);
+      fs.mkdirSync(level);
+      throw notFound();
+    });
+
+    try {
+      const result = await sandboxed.call("s3_get_object", {
+        bucket: "b",
+        key: "missing.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBe(true);
+      expect(fs.existsSync(level)).toBe(true);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // Without a pin (no /proc, or not Linux) the cleanup falls back to paths, so a level
+  // is removed only while it is still the inode that was created.
+  posixIt("keeps a directory outside the root when cleaning up without a pin", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-off-root-"));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-off-out-"));
+    const shared = path.join(root, "shared");
+    fs.mkdirSync(shared);
+    const bystander = path.join(outside, "lock");
+    fs.mkdirSync(bystander);
+    const target = path.join(shared, "x", "lock", "out.txt");
+    const sandboxed = new ToolHarness();
+    registerS3ObjectTools(sandboxed, s3.asPeerClient(), versionGuard, {
+      ...testConfig,
+      fileRoot: root,
+    });
+    const realPlatform = process.platform;
+    Object.defineProperty(process, "platform", { value: "darwin" });
+    s3.respond("getObject", () => {
+      fs.renameSync(path.join(shared, "x"), path.join(shared, "x.stash"));
+      fs.symlinkSync(outside, path.join(shared, "x"));
+      throw notFound();
+    });
+
+    try {
+      const result = await sandboxed.call("s3_get_object", {
+        bucket: "b",
+        key: "missing.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBe(true);
+      expect(fs.existsSync(bystander)).toBe(true);
+      expect(fs.readdirSync(outside)).toEqual(["lock"]);
+    } finally {
+      Object.defineProperty(process, "platform", { value: realPlatform });
+      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  // The pin proves the name held this download's file once, before the body arrives.
+  // Anyone who may write the directory can swap the entry afterwards, so the identity is
+  // confirmed again at the commit rather than assumed to have held.
+  linuxIt("refuses to commit a temp entry that was replaced mid-download", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-entry-"));
+    const target = path.join(dir, "out.txt");
+    fs.writeFileSync(target, "KEEP\n");
+    const opened = trackOpenedHandles();
+    s3.respond("getObject", () => {
+      const temp = opened.paths.find((name) => name.endsWith(".part"));
+      if (temp) {
+        fs.rmSync(temp);
+        fs.writeFileSync(temp, "ACTOR\n");
+      }
+      return downloadedObject({
+        contentLength: 3,
+        body: streamFrom([new TextEncoder().encode("NEW")]),
+      });
+    });
+
+    try {
+      const result = await tools.call("s3_get_object", {
+        bucket: "b",
+        key: "hello.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBe(true);
+      expectBadRequestToolError(result, /temp file was replaced while the download was in flight/i);
+      expect(fs.readFileSync(target, "utf8")).toBe("KEEP\n");
+    } finally {
+      opened.restore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  posixIt("refuses to replace a destination whose permissions changed mid-download", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-tighten-"));
+    const target = path.join(dir, "out.txt");
+    fs.writeFileSync(target, "KEEP\n");
+    fs.chmodSync(target, 0o666);
+    // The owner tightens the file while the body is in flight; committing the bits
+    // captured before the fetch would hand back the wider mode.
+    s3.respond("getObject", () => {
+      fs.chmodSync(target, 0o600);
+      return downloadedObject({
+        contentLength: 3,
+        body: streamFrom([new TextEncoder().encode("NEW")]),
+      });
+    });
+
+    try {
+      const result = await tools.call("s3_get_object", {
+        bucket: "b",
+        key: "hello.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBe(true);
+      expectBadRequestToolError(result, /changed owner or permissions while the download/i);
+      expect(fs.statSync(target).mode & 0o777).toBe(0o600);
+      expect(fs.readFileSync(target, "utf8")).toBe("KEEP\n");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  linuxIt("refuses a sandboxed save when /proc cannot be read", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-proc-root-"));
+    const target = path.join(root, "out.txt");
+    fs.writeFileSync(target, "KEEP\n");
+    const sandboxed = new ToolHarness();
+    registerS3ObjectTools(sandboxed, s3.asPeerClient(), versionGuard, {
+      ...testConfig,
+      fileRoot: root,
+    });
+    const realReadlink = fs.promises.readlink.bind(fs.promises);
+    const readlinkSpy = vi.spyOn(fs.promises, "readlink").mockImplementation(async (queried) => {
+      if (String(queried).startsWith("/proc/self/fd/")) {
+        throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      }
+      return realReadlink(queried as Parameters<typeof realReadlink>[0]);
+    });
+    queueWebBody("NEW");
+
+    try {
+      const result = await sandboxed.call("s3_get_object", {
+        bucket: "b",
+        key: "hello.txt",
+        saveToPath: target,
+      });
+
+      // No pin is possible here, so the sandboxed request fails instead of quietly
+      // running the path-based operations it is meant to have replaced.
+      expect(result.isError).toBe(true);
+      expectBadRequestToolError(result, /\/proc is unavailable/i);
+      expect(fs.readFileSync(target, "utf8")).toBe("KEEP\n");
+      expect(fs.readdirSync(root)).toEqual(["out.txt"]);
+    } finally {
+      readlinkSpy.mockRestore();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  linuxIt("keeps the directories it created when the parent cannot be pinned", async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-none-dir-"));
+    const dir = path.join(base, "a", "b");
+    const target = path.join(dir, "out.txt");
+    const realOpen = fs.promises.open.bind(fs.promises);
+    const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
+      if (String(args[0]) === dir) throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+      return realOpen(...(args as Parameters<typeof realOpen>));
+    });
+    queueWebBody("NEW");
+
+    try {
+      const result = await tools.call("s3_get_object", {
+        bucket: "b",
+        key: "hello.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBe(true);
+      // Left in place: the directory they were created in is no longer confirmed.
+      expect(fs.readdirSync(dir)).toEqual([]);
+    } finally {
+      openSpy.mockRestore();
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  linuxIt("refuses the save when the parent directory cannot be pinned", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-none-"));
+    const target = path.join(dir, "out.txt");
+    fs.writeFileSync(target, "KEEP\n");
+    const realOpen = fs.promises.open.bind(fs.promises);
+    // A directory the caller can write but not open is enough to lose the pin, so the
+    // save must fail rather than fall back to the path-based operations.
+    const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
+      if (String(args[0]) === dir) throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+      return realOpen(...(args as Parameters<typeof realOpen>));
+    });
+    queueWebBody("NEW");
+
+    try {
+      const result = await tools.call("s3_get_object", {
+        bucket: "b",
+        key: "hello.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBe(true);
+      expectBadRequestToolError(result, /changed while the download was being prepared/i);
+      expect(fs.readFileSync(target, "utf8")).toBe("KEEP\n");
+      expect(fs.readdirSync(dir)).toEqual(["out.txt"]);
+    } finally {
+      openSpy.mockRestore();
+      fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 

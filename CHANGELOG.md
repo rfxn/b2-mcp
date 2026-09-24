@@ -13,23 +13,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - `s3_get_object` `saveToPath` no longer truncates or deletes an existing file
-  when a download fails: bytes stream to an exclusively created sibling temp
-  file that is synced to disk and renamed into place only on success. When the
-  response reports a content length, a body that ends short fails with
-  `incomplete_download` (HTTP 502) and leaves the target untouched; the success
-  message now reports the bytes actually written. A replaced file keeps its
-  permission bits and, where the process may set them, its owner and group;
-  symlinks are written through and dangling links are replaced, never followed.
-  Directory, non-regular, read-only, and non-writable directory targets are
-  rejected before the object is fetched; under `B2_FILE_ROOT` the sandbox is
-  re-checked after parent directories are created, and the opened temp file's
-  actual location is verified inside the root before any byte is written, so a
-  symlinked directory swapped between validation and open is detected. Every
-  failure path closes and removes the temp file and any directories it created.
-  Because the file is replaced rather than rewritten in place, hard links,
-  extended attributes (including SELinux labels), and ACLs are not carried over,
-  and a target that cannot be renamed over, such as a single-file bind mount,
-  now fails with `bad_request` and is left unchanged. (#449)
+  when a download fails: bytes stream to a sibling temp file that is renamed into
+  place only on success, a body that ends short of a reported content length fails
+  with `incomplete_download` (HTTP 502), and the success message reports the bytes
+  actually written. A replaced file keeps its permission bits, and its owner and
+  group where the process may set them. Under `B2_FILE_ROOT` the write no longer
+  follows a symlink out of the root, and on Linux the commit and cleanup run
+  relative to a held descriptor for the verified parent directory; a temp file or
+  destination that changed while the body was in flight is refused rather than
+  committed. Because the file is replaced rather than rewritten, hard links,
+  extended attributes, and ACLs are not carried over, and a target that cannot be
+  renamed over now fails with `bad_request`. (#449)
 
 ## [0.2.1] - 2026-09-04
 
