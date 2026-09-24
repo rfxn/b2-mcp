@@ -16,7 +16,7 @@ import { currentMcpRequestSignal } from "../request-context.js";
 import { withS3Circuit, withS3LongCircuit } from "../utils/circuit-breaker.js";
 import { checkDestructive } from "../utils/destructive-gate.js";
 import { badRequestError, codedError, toolError, toolJson, toolSuccess } from "../utils/errors.js";
-import { FileAccessError, resolveLocalPath } from "../utils/fs-guard.js";
+import { FileAccessError, isInsideFileRoot, resolveLocalPath } from "../utils/fs-guard.js";
 import { logger } from "../utils/logger.js";
 import { timeoutError } from "../utils/named-error.js";
 import type { B2Config, B2S3FileVersionBinding, B2S3VersionGuard } from "../utils/types.js";
@@ -279,6 +279,37 @@ async function preserveOwnership(
   }
 }
 
+/**
+ * Path checks alone can be raced by swapping a symlinked ancestor between the
+ * check and `open` (Node has no `openat`), so confirm where the opened temp file
+ * really is. Linux reports the descriptor's path directly; elsewhere the real
+ * path must hold the very same file (device and inode) as the handle. Either
+ * way the result is compared to the root without resolving it again.
+ */
+async function assertOpenedInsideFileRoot(
+  handle: fs.promises.FileHandle,
+  tempPath: string,
+  config: B2Config,
+): Promise<void> {
+  let openedPath: string | undefined;
+  if (process.platform === "linux") {
+    openedPath = await fs.promises.readlink(`/proc/self/fd/${handle.fd}`).catch(() => undefined);
+  }
+  if (openedPath === undefined) {
+    const [opened, realPath] = await Promise.all([
+      handle.stat(),
+      fs.promises.realpath(tempPath).catch(() => undefined),
+    ]);
+    const onDisk = realPath ? await fs.promises.stat(realPath).catch(() => undefined) : undefined;
+    if (onDisk && onDisk.dev === opened.dev && onDisk.ino === opened.ino) openedPath = realPath;
+  }
+  if (openedPath === undefined || !isInsideFileRoot(config, openedPath)) {
+    throw badRequestError(
+      `Path is outside the allowed directory (${config.fileRoot}); the saveToPath directory changed while the download was being prepared.`,
+    );
+  }
+}
+
 /** Longest prefix of `name` within `maxBytes` of UTF-8 that never splits a character. */
 function utf8Prefix(name: string, maxBytes: number): string {
   let prefix = "";
@@ -319,7 +350,7 @@ async function removeCreatedDirs(dir: string, firstCreated: string | undefined):
 async function downloadToPath(
   target: SaveToPathTarget,
   fetchObject: () => Promise<B2S3DownloadedObject>,
-  recheckDir?: (dir: string) => void,
+  sandbox?: B2Config,
 ): Promise<number> {
   const dir = path.dirname(target.path);
   // At most 64 UTF-8 bytes of the name plus the 24-byte suffix keeps the temp
@@ -334,8 +365,9 @@ async function downloadToPath(
     firstCreatedDir = await fs.promises.mkdir(dir, { recursive: true });
     // Re-apply the sandbox check to the now-existing directory: a symlinked
     // ancestor that was dangling when the path was vetted may have been given a
-    // target outside the root since, and mkdir would then have followed it.
-    recheckDir?.(dir);
+    // target outside the root since, and mkdir would then have followed it. The
+    // opened file's actual location is verified again once it is open.
+    if (sandbox) resolveLocalPath(sandbox, dir, "write");
     // "wx" is O_CREAT|O_EXCL: never follows or reuses an existing path. Creating
     // with the replaced file's bits (umask only narrows them) keeps private
     // contents from ever being more readable than the file they replace.
@@ -350,6 +382,7 @@ async function downloadToPath(
   let writeStream: fs.WriteStream | undefined;
   let committed = false;
   try {
+    if (sandbox) await assertOpenedInsideFileRoot(handle, tempPath, sandbox);
     // Owner and mode are set before any byte lands, so the contents are never
     // exposed under looser metadata than the file they replace.
     if (target.existing) {
@@ -831,7 +864,7 @@ export function registerS3ObjectTools(
           const bytes = await downloadToPath(
             saveTarget,
             getObject,
-            config.fileRoot ? (dir) => resolveLocalPath(config, dir, "write") : undefined,
+            config.fileRoot ? config : undefined,
           );
           return toolSuccess(`Object saved to ${saveTarget.path} (${bytes} bytes)`);
         }

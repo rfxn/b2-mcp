@@ -934,6 +934,63 @@ describe("S3 object tools with deterministic handler fake", () => {
     }
   });
 
+  for (const platform of ["linux", "darwin"] as const) {
+    posixIt(
+      `rejects a temp file opened outside the file root by a symlink swap (${platform} check)`,
+      async () => {
+        const root = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-swap-root-"));
+        const outside = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-swap-out-"));
+        const inner = path.join(root, "inner");
+        const link = path.join(root, "link");
+        // Dangling while the path is vetted, so the link stays in the lexical
+        // path; it becomes a valid in-root directory before the parent is made.
+        fs.symlinkSync(inner, link);
+        const racingGuard: B2S3VersionGuard = {
+          ...versionGuard,
+          async resolveS3FileVersion() {
+            fs.mkdirSync(inner);
+            return fileVersion();
+          },
+        };
+        const sandboxed = new ToolHarness();
+        registerS3ObjectTools(sandboxed, s3.asPeerClient(), racingGuard, {
+          ...testConfig,
+          fileRoot: root,
+        });
+        // Every path check passes; the ancestor is swapped at the last moment, so
+        // the exclusive create itself lands outside the root.
+        const realOpen = fs.promises.open.bind(fs.promises);
+        const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
+          fs.rmSync(link);
+          fs.symlinkSync(outside, link);
+          return realOpen(...(args as Parameters<typeof realOpen>));
+        });
+        const realPlatform = process.platform;
+        Object.defineProperty(process, "platform", { value: platform });
+
+        try {
+          const result = await sandboxed.call("s3_get_object", {
+            bucket: "b",
+            key: "hello.txt",
+            versionId: "version-hello",
+            saveToPath: path.join(root, "link", "out.txt"),
+          });
+
+          expect(result.isError).toBe(true);
+          expectBadRequestToolError(result, /outside the allowed directory/i);
+          expect(s3.requestsFor("getObject")).toHaveLength(0);
+          expect(fs.readdirSync(outside)).toEqual([]);
+          expect(fs.readdirSync(inner)).toEqual([]);
+        } finally {
+          Object.defineProperty(process, "platform", { value: realPlatform });
+          openSpy.mockRestore();
+          fs.rmSync(root, { recursive: true, force: true });
+          fs.rmSync(outside, { recursive: true, force: true });
+        }
+      },
+    );
+  }
+
   nonRootPosixIt("rejects a non-writable directory before fetching the object", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-ro-dir-"));
     const target = path.join(dir, "writable.txt");

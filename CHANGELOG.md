@@ -20,10 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   symlinks are written through and dangling links are replaced, never followed.
   Directory, non-regular, read-only, and non-writable directory targets are
   rejected before the object is fetched; under `B2_FILE_ROOT` the sandbox is
-  re-checked after parent directories are created. Every failure path closes and
-  removes the temp file and any directories it created. Because the file is
-  replaced rather than rewritten in place, hard links, extended attributes, and
-  ACLs are not carried over. (#449)
+  re-checked after parent directories are created, and the opened temp file's
+  actual location is verified inside the root before any byte is written, so a
+  symlink swapped mid-request is detected. Every failure path closes and removes
+  the temp file and any directories it created. Because the file is replaced
+  rather than rewritten in place, hard links, extended attributes, and ACLs are
+  not carried over. (#449)
 
 ## [0.2.1] - 2026-09-04
 
