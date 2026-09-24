@@ -197,7 +197,7 @@ interface SaveToPathTarget {
   /** Final path the completed download is renamed onto. */
   path: string;
   /** Metadata of the regular file being replaced, or undefined for a new file. */
-  existing: { mode: number; uid: number; gid: number } | undefined;
+  existing: { mode: number; uid: number; gid: number; dev: number; ino: number } | undefined;
 }
 
 /** Errno codes that mean the caller named a local path this process cannot write. */
@@ -259,7 +259,16 @@ async function prepareSaveToPathTarget(
     throw badRequestError(`saveToPath target '${target}' exists and is not writable.`);
   }
   // Permission bits only: setuid/setgid/sticky are not carried onto new remote content.
-  return { path: target, existing: { mode: stat.mode & 0o777, uid: stat.uid, gid: stat.gid } };
+  return {
+    path: target,
+    existing: {
+      mode: stat.mode & 0o777,
+      uid: stat.uid,
+      gid: stat.gid,
+      dev: stat.dev,
+      ino: stat.ino,
+    },
+  };
 }
 
 /**
@@ -326,7 +335,9 @@ async function assertOpenedInsideFileRoot(
       realPath = undefined;
     }
     const onDisk = realPath ? await fs.promises.stat(realPath).catch(() => undefined) : undefined;
-    if (onDisk && onDisk.dev === opened.dev && onDisk.ino === opened.ino) openedPath = realPath;
+    // A second link could be a name outside the root for the same file.
+    if (onDisk?.dev === opened.dev && onDisk.ino === opened.ino && opened.nlink === 1)
+      openedPath = realPath;
   }
   if (openedPath === undefined || !isInsideFileRoot(config, openedPath)) {
     throw badRequestError(
@@ -339,7 +350,6 @@ async function assertOpenedInsideFileRoot(
 interface CommitAnchor {
   handle: fs.promises.FileHandle;
   dir: string;
-  temp: { dev: number; ino: number };
 }
 
 /** A path that resolves `name` inside the pinned directory `dirFd`, ignoring its own path. */
@@ -362,7 +372,7 @@ async function pinnedDirInsideRoot(dirFd: number, sandbox?: B2Config): Promise<b
 }
 
 type ParentPin =
-  | { kind: "pinned"; handle: fs.promises.FileHandle; temp: { dev: number; ino: number } }
+  | { kind: "pinned"; handle: fs.promises.FileHandle }
   | { kind: "unavailable" }
   | { kind: "refused"; message: string };
 
@@ -423,7 +433,7 @@ async function pinParentDir(
         ),
       );
     }
-    return { kind: "pinned", handle: dirHandle, temp: { dev: opened.dev, ino: opened.ino } };
+    return { kind: "pinned", handle: dirHandle };
   } catch {
     return await refuse(changed);
   }
@@ -490,6 +500,8 @@ async function removeCreatedDirs(
 ): Promise<void> {
   const deepestFirst = [...createdDirs].reverse();
   if (!anchor || deepestFirst[0]?.path !== anchor.dir) {
+    // A path-based removal can be redirected by a swapped ancestor, so a sandbox keeps them.
+    if (sandbox) return;
     for (const created of deepestFirst) {
       const onDisk = await fs.promises.lstat(created.path).catch(() => undefined);
       if (!onDisk?.isDirectory() || onDisk.dev !== created.dev || onDisk.ino !== created.ino)
@@ -546,18 +558,18 @@ async function assertCommitStillMatchesVetting(
       `The saveToPath temp file was replaced while the download was in flight; '${target.path}' was left unchanged.`,
     );
   }
-  if (!target.existing) return;
   const now = await fs.promises.stat(at(path.basename(target.path))).catch(() => undefined);
-  // Only a file still shaped like the one that was vetted is compared; anything else is
-  // left for the rename itself to refuse.
-  if (
-    now?.isFile() &&
-    ((now.mode & 0o777) !== target.existing.mode ||
-      now.uid !== target.existing.uid ||
-      now.gid !== target.existing.gid)
-  ) {
+  const was = target.existing;
+  const unchanged = was
+    ? now?.dev === was.dev &&
+      now.ino === was.ino &&
+      (now.mode & 0o777) === was.mode &&
+      now.uid === was.uid &&
+      now.gid === was.gid
+    : now === undefined;
+  if (!unchanged) {
     throw badRequestError(
-      `saveToPath target '${target.path}' changed owner or permissions while the download was in flight; it was left unchanged.`,
+      `saveToPath target '${target.path}' changed while the download was in flight; it was left unchanged.`,
     );
   }
 }
@@ -603,10 +615,7 @@ async function downloadToPath(
       target.existing ? target.existing.mode & 0o700 : 0o666,
     );
   } catch (err) {
-    // Under a sandbox the recorded inodes come from a path lookup that a swapped
-    // ancestor can have aimed outside the root, and nothing is pinned yet, so the
-    // directories are left in place rather than removed by path.
-    if (!sandbox) await removeCreatedDirs(createdDirs);
+    await removeCreatedDirs(createdDirs, undefined, sandbox);
     if (err instanceof FileAccessError) throw badRequestError(err.message);
     throw notWritableError(err, `directory '${dir}'`);
   }
@@ -618,12 +627,13 @@ async function downloadToPath(
   // Set once the opened file and its directory are confirmed to be the ones that were
   // vetted; until then a swapped ancestor could aim the directory cleanup elsewhere.
   let cleanupIsSafe = false;
+  let tempId: { dev: number; ino: number } | undefined;
   try {
-    if (sandbox) await assertOpenedInsideFileRoot(handle, tempPath, sandbox);
     const opened = await handle.stat();
-    const tempId = { dev: opened.dev, ino: opened.ino };
+    tempId = { dev: opened.dev, ino: opened.ino };
+    if (sandbox) await assertOpenedInsideFileRoot(handle, tempPath, sandbox);
     const pin = await pinParentDir(dir, handle, tempName, sandbox);
-    if (pin.kind === "pinned") anchor = { handle: pin.handle, dir, temp: pin.temp };
+    if (pin.kind === "pinned") anchor = { handle: pin.handle, dir };
     if (pin.kind === "refused") throw badRequestError(pin.message);
     cleanupIsSafe = true;
     // Owner and mode are set before any byte lands, so the contents are never
@@ -689,11 +699,11 @@ async function downloadToPath(
     writeStream?.destroy();
     await handle.close().catch(() => undefined);
     if (!committed) {
-      // The temp name carries 48 random bits, so even a path-based unlink cannot be
-      // aimed at anything this download did not create.
-      await fs.promises
-        .unlink(anchor ? atDirFd(anchor.handle.fd, tempName) : tempPath)
-        .catch(() => undefined);
+      const temp = anchor ? atDirFd(anchor.handle.fd, tempName) : tempPath;
+      const entry = await fs.promises.lstat(temp).catch(() => undefined);
+      if (entry && entry.dev === tempId?.dev && entry.ino === tempId.ino) {
+        await fs.promises.unlink(temp).catch(() => undefined);
+      }
       // Directory names are predictable, so they are only removed once the directory
       // this download wrote to has been confirmed.
       if (cleanupIsSafe) await removeCreatedDirs(createdDirs, anchor, sandbox);
