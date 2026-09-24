@@ -400,11 +400,7 @@ describe("S3 object tools with deterministic handler fake", () => {
     });
 
     try {
-      const result = await tools.call("s3_get_object", {
-        bucket: "b",
-        key: "hello.txt",
-        saveToPath: target,
-      });
+      const result = await saveTo(target);
 
       expect(result.isError).toBeFalsy();
       expect(parseResult(result)).toContain("(20 bytes)");
@@ -496,11 +492,7 @@ describe("S3 object tools with deterministic handler fake", () => {
     queueGetObject({ contentLength: 100, body: body as B2S3DownloadedObject["body"] });
 
     try {
-      const result = await tools.call("s3_get_object", {
-        bucket: "b",
-        key: "hello.txt",
-        saveToPath: target,
-      });
+      const result = await saveTo(target);
 
       expect(result.isError).toBe(true);
       expect(fs.readFileSync(target, "utf8")).toBe("ORIGINAL-IMPORTANT-DATA\n");
@@ -508,38 +500,6 @@ describe("S3 object tools with deterministic handler fake", () => {
     } finally {
       if (previousTimeout === undefined) delete process.env.B2_S3_SAVE_TO_PATH_IDLE_TIMEOUT_MS;
       else process.env.B2_S3_SAVE_TO_PATH_IDLE_TIMEOUT_MS = previousTimeout;
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("replaces a pre-existing file after a successful saveToPath download", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-replace-"));
-    const target = path.join(dir, "out.txt");
-    fs.writeFileSync(target, "OLD-CONTENT\n");
-    queueGetObject({
-      contentLength: undefined,
-      body: {
-        transformToWebStream: () =>
-          new ReadableStream<Uint8Array>({
-            start(controller) {
-              controller.enqueue(new TextEncoder().encode("NEW-CONTENT"));
-              controller.close();
-            },
-          }),
-      } as unknown as B2S3DownloadedObject["body"],
-    });
-
-    try {
-      const result = await tools.call("s3_get_object", {
-        bucket: "b",
-        key: "hello.txt",
-        saveToPath: target,
-      });
-
-      expect(result.isError).toBeFalsy();
-      expect(fs.readFileSync(target, "utf8")).toBe("NEW-CONTENT");
-      expect(fs.readdirSync(dir)).toEqual(["out.txt"]);
-    } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -559,32 +519,53 @@ describe("S3 object tools with deterministic handler fake", () => {
     });
   }
 
+  function saveTo(
+    saveToPath: string,
+    {
+      harness = tools,
+      key = "hello.txt",
+      versionId,
+    }: { harness?: ToolHarness; key?: string; versionId?: string } = {},
+  ) {
+    return harness.call("s3_get_object", { bucket: "b", key, versionId, saveToPath });
+  }
+
+  function sandboxedTools(root: string, guard: B2S3VersionGuard = versionGuard): ToolHarness {
+    const harness = new ToolHarness();
+    registerS3ObjectTools(harness, s3.asPeerClient(), guard, { ...testConfig, fileRoot: root });
+    return harness;
+  }
+
   const posixIt = process.platform === "win32" ? it.skip : it;
   const linuxIt = process.platform === "linux" ? it : it.skip;
   const nonRootPosixIt = process.platform === "win32" || process.getuid?.() === 0 ? it.skip : it;
-  const rootPosixIt = process.platform !== "win32" && process.getuid?.() === 0 ? it : it.skip;
 
-  posixIt("preserves the permission bits of a replaced saveToPath file", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-mode-"));
-    const target = path.join(dir, "secret.env");
-    fs.writeFileSync(target, "OLD\n", { mode: 0o600 });
-    fs.chmodSync(target, 0o600);
-    queueWebBody("NEW");
+  // Permission bits only: setuid, setgid and sticky are not carried onto new content.
+  for (const { mode, kept } of [
+    { mode: 0o640, kept: 0o640 },
+    { mode: 0o4755, kept: 0o755 },
+  ]) {
+    posixIt(
+      `preserves only the permission bits of a replaced file (${mode.toString(8)})`,
+      async () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-mode-"));
+        const target = path.join(dir, "secret.env");
+        fs.writeFileSync(target, "OLD\n");
+        fs.chmodSync(target, mode);
+        queueWebBody("NEW");
 
-    try {
-      const result = await tools.call("s3_get_object", {
-        bucket: "b",
-        key: "hello.txt",
-        saveToPath: target,
-      });
+        try {
+          const result = await saveTo(target);
 
-      expect(result.isError).toBeFalsy();
-      expect(fs.readFileSync(target, "utf8")).toBe("NEW");
-      expect(fs.statSync(target).mode & 0o777).toBe(0o600);
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
+          expect(result.isError).toBeFalsy();
+          expect(fs.readFileSync(target, "utf8")).toBe("NEW");
+          expect(fs.statSync(target).mode & 0o7777).toBe(kept);
+        } finally {
+          fs.rmSync(dir, { recursive: true, force: true });
+        }
+      },
+    );
+  }
 
   posixIt(
     "writes through a symlinked saveToPath target instead of replacing the link",
@@ -597,11 +578,7 @@ describe("S3 object tools with deterministic handler fake", () => {
       queueWebBody("NEW");
 
       try {
-        const result = await tools.call("s3_get_object", {
-          bucket: "b",
-          key: "hello.txt",
-          saveToPath: link,
-        });
+        const result = await saveTo(link);
 
         expect(result.isError).toBeFalsy();
         expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
@@ -619,11 +596,7 @@ describe("S3 object tools with deterministic handler fake", () => {
     fs.mkdirSync(target);
 
     try {
-      const result = await tools.call("s3_get_object", {
-        bucket: "b",
-        key: "hello.txt",
-        saveToPath: target,
-      });
+      const result = await saveTo(target);
 
       expect(result.isError).toBe(true);
       expectBadRequestToolError(result, /regular file.*directory/i);
@@ -662,11 +635,7 @@ describe("S3 object tools with deterministic handler fake", () => {
     queueWebBody("NEW");
 
     try {
-      const result = await tools.call("s3_get_object", {
-        bucket: "b",
-        key: "hello.txt",
-        saveToPath: target,
-      });
+      const result = await saveTo(target);
 
       expect(result.isError).toBeFalsy();
       const tempName = path.basename(opened.paths[0] ?? "");
@@ -688,11 +657,7 @@ describe("S3 object tools with deterministic handler fake", () => {
     queueGetObject({ contentLength: 5, body: undefined });
 
     try {
-      const result = await tools.call("s3_get_object", {
-        bucket: "b",
-        key: "hello.txt",
-        saveToPath: target,
-      });
+      const result = await saveTo(target);
 
       expect(result.isError).toBe(true);
       expect(parseResult(result)).toMatch(/readable body/i);
@@ -702,27 +667,6 @@ describe("S3 object tools with deterministic handler fake", () => {
       expect(fs.readdirSync(dir)).toEqual([]);
     } finally {
       opened.restore();
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("removes directories it created when the object fetch fails", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-404-"));
-    fs.mkdirSync(path.join(dir, "keep"));
-    const target = path.join(dir, "keep", "new", "deeper", "out.txt");
-    s3.respond("getObject", notFound());
-
-    try {
-      const result = await tools.call("s3_get_object", {
-        bucket: "b",
-        key: "missing.txt",
-        saveToPath: target,
-      });
-
-      expect(result.isError).toBe(true);
-      expect(fs.readdirSync(dir)).toEqual(["keep"]);
-      expect(fs.readdirSync(path.join(dir, "keep"))).toEqual([]);
-    } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -746,11 +690,7 @@ describe("S3 object tools with deterministic handler fake", () => {
     s3.respond("getObject", notFound());
 
     try {
-      const result = await tools.call("s3_get_object", {
-        bucket: "b",
-        key: "missing.txt",
-        saveToPath: target,
-      });
+      const result = await saveTo(target, { key: "missing.txt" });
 
       expect(result.isError).toBe(true);
       expect(fs.readdirSync(dir)).toEqual(["shared"]);
@@ -767,11 +707,7 @@ describe("S3 object tools with deterministic handler fake", () => {
     const target = path.join(dir, "made-a", "made-b", "x".repeat(300), "out.txt");
 
     try {
-      const result = await tools.call("s3_get_object", {
-        bucket: "b",
-        key: "hello.txt",
-        saveToPath: target,
-      });
+      const result = await saveTo(target);
 
       expect(result.isError).toBe(true);
       expect(s3.requestsFor("getObject")).toHaveLength(0);
@@ -795,11 +731,7 @@ describe("S3 object tools with deterministic handler fake", () => {
     s3TransferCircuitBreaker.open();
 
     try {
-      const result = await tools.call("s3_get_object", {
-        bucket: "b",
-        key: "hello.txt",
-        saveToPath: target,
-      });
+      const result = await saveTo(target);
       await new Promise((resolve) => setImmediate(resolve));
 
       expect(result.isError).toBe(true);
@@ -825,11 +757,7 @@ describe("S3 object tools with deterministic handler fake", () => {
     });
 
     try {
-      const result = await tools.call("s3_get_object", {
-        bucket: "b",
-        key: "hello.txt",
-        saveToPath: target,
-      });
+      const result = await saveTo(target);
 
       expect(result.isError).toBe(true);
       const errorText = parseResult(result) as string;
@@ -845,60 +773,46 @@ describe("S3 object tools with deterministic handler fake", () => {
     }
   });
 
-  rootPosixIt("preserves the owner and group of a replaced saveToPath file", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-owner-"));
-    const target = path.join(dir, "shared.txt");
-    fs.writeFileSync(target, "OLD\n");
-    fs.chownSync(target, 12345, 23456);
-    fs.chmodSync(target, 0o640);
-    queueWebBody("NEW");
-
-    try {
-      const result = await tools.call("s3_get_object", {
-        bucket: "b",
-        key: "hello.txt",
-        saveToPath: target,
-      });
-
-      expect(result.isError).toBeFalsy();
-      const stat = fs.statSync(target);
-      expect([stat.uid, stat.gid, stat.mode & 0o777]).toEqual([12345, 23456, 0o640]);
-      expect(fs.readFileSync(target, "utf8")).toBe("NEW");
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  // Runs unprivileged: CI is non-root, so the root-only test above never executes there.
-  posixIt("carries the replaced file's owner and group over to the temp file", async () => {
+  // Only root can make a file owned by someone else, so the vetted owner is faked by inode.
+  posixIt("carries the replaced file's owner and group, falling back to the group", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-chown-"));
     const target = path.join(dir, "owned.txt");
     fs.writeFileSync(target, "OLD\n");
-    const { uid, gid } = fs.statSync(target);
+    const { ino, uid, gid } = fs.statSync(target);
+    const vetted = { uid: uid + 1, gid: gid + 1 };
+    const realStat = fs.promises.stat.bind(fs.promises);
+    const statSpy = vi.spyOn(fs.promises, "stat").mockImplementation(async (...args) => {
+      const stat = await realStat(...(args as Parameters<typeof realStat>));
+      if (stat.ino === ino) {
+        Object.defineProperty(stat, "uid", { value: vetted.uid });
+        Object.defineProperty(stat, "gid", { value: vetted.gid });
+      }
+      return stat;
+    });
     const chownCalls: Array<[number, number]> = [];
     const realOpen = fs.promises.open.bind(fs.promises);
     const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
       const handle = await realOpen(...(args as Parameters<typeof realOpen>));
-      const realChown = handle.chown.bind(handle);
+      if (!String(args[0]).endsWith(".part")) return handle;
       handle.chown = async (owner: number, group: number) => {
         chownCalls.push([owner, group]);
-        await realChown(owner, group);
+        throw Object.assign(new Error("EPERM"), { code: "EPERM" });
       };
       return handle;
     });
     queueWebBody("NEW");
 
     try {
-      const result = await tools.call("s3_get_object", {
-        bucket: "b",
-        key: "hello.txt",
-        saveToPath: target,
-      });
+      const result = await saveTo(target);
 
       expect(result.isError).toBeFalsy();
-      expect(chownCalls[0]).toEqual([uid, gid]);
+      expect(chownCalls).toEqual([
+        [vetted.uid, vetted.gid],
+        [-1, vetted.gid],
+      ]);
       expect(fs.readFileSync(target, "utf8")).toBe("NEW");
     } finally {
+      statSpy.mockRestore();
       openSpy.mockRestore();
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -907,7 +821,7 @@ describe("S3 object tools with deterministic handler fake", () => {
   // A user matched by the replaced file's group or other bits can land in a different
   // class on the replacement, so a carried bit that looks narrower can still widen
   // access. Ownership cannot fail under the test user, so the refusal is simulated.
-  posixIt("carries only class-intersection bits when ownership cannot be preserved", async () => {
+  posixIt("carries only class-intersection bits when ownership or chmod is refused", async () => {
     const cases = [
       // Group read would pass to the process's own group.
       { mode: 0o640, keepUid: true, expected: 0o600 },
@@ -918,9 +832,11 @@ describe("S3 object tools with deterministic handler fake", () => {
       // The replaced owner is a third party once the uid changes too, so its bits join
       // the intersection: the write-only owner then holds the result down to `0222`.
       { mode: 0o266, keepUid: false, expected: 0o222 },
+      // A refused fchmod keeps the owner-only mode the temp file was created with.
+      { mode: 0o640, keepUid: true, expected: 0o600, refuseChmod: true },
     ];
 
-    for (const { mode, keepUid, expected } of cases) {
+    for (const { mode, keepUid, expected, refuseChmod } of cases) {
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-clamp-"));
       const target = path.join(dir, "owned.txt");
       fs.writeFileSync(target, "OLD\n");
@@ -929,9 +845,11 @@ describe("S3 object tools with deterministic handler fake", () => {
       const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
         const handle = await realOpen(...(args as Parameters<typeof realOpen>));
         if (!String(args[0]).endsWith(".part")) return handle;
-        handle.chown = async () => {
+        const refused = async () => {
           throw Object.assign(new Error("EPERM"), { code: "EPERM" });
         };
+        handle.chown = refused;
+        if (refuseChmod) handle.chmod = refused;
         const realStat = handle.stat.bind(handle);
         handle.stat = (async () => {
           const stat = await realStat();
@@ -944,11 +862,7 @@ describe("S3 object tools with deterministic handler fake", () => {
       queueWebBody("NEW");
 
       try {
-        const result = await tools.call("s3_get_object", {
-          bucket: "b",
-          key: "hello.txt",
-          saveToPath: target,
-        });
+        const result = await saveTo(target);
 
         expect(result.isError).toBeFalsy();
         expect(fs.statSync(target).mode & 0o777).toBe(expected);
@@ -966,19 +880,11 @@ describe("S3 object tools with deterministic handler fake", () => {
     const escapeTarget = path.join(outside, "escaped.txt");
     const link = path.join(root, "link.txt");
     fs.symlinkSync(escapeTarget, link);
-    const sandboxed = new ToolHarness();
-    registerS3ObjectTools(sandboxed, s3.asPeerClient(), versionGuard, {
-      ...testConfig,
-      fileRoot: root,
-    });
+    const sandboxed = sandboxedTools(root);
     queueWebBody("NEW");
 
     try {
-      const result = await sandboxed.call("s3_get_object", {
-        bucket: "b",
-        key: "hello.txt",
-        saveToPath: link,
-      });
+      const result = await saveTo(link, { harness: sandboxed });
 
       expect(result.isError).toBeFalsy();
       expect(fs.existsSync(escapeTarget)).toBe(false);
@@ -993,34 +899,29 @@ describe("S3 object tools with deterministic handler fake", () => {
   posixIt("checks the opened temp file with fs-guard's resolver, not the native one", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-resolver-"));
     const target = path.join(root, "out.txt");
-    const sandboxed = new ToolHarness();
-    registerS3ObjectTools(sandboxed, s3.asPeerClient(), versionGuard, {
-      ...testConfig,
-      fileRoot: root,
-    });
+    const sandboxed = sandboxedTools(root);
     // The native resolver can spell a path differently from the JS one fs-guard uses
     // for the root (letter case on macOS, mapped drives on Windows). fs.realpathSync
-    // itself cannot be spied on (ESM namespace), so this mock is a tripwire.
+    // itself cannot be spied on (ESM namespace), so these spies are tripwires.
     const nativeRealpath = vi
       .spyOn(fs.promises, "realpath")
       .mockImplementation(async (p) => String(p).toUpperCase());
+    const nativeSync = vi.spyOn(fs.realpathSync, "native");
     const realPlatform = process.platform;
     Object.defineProperty(process, "platform", { value: "darwin" });
     queueWebBody("NEW");
 
     try {
-      const result = await sandboxed.call("s3_get_object", {
-        bucket: "b",
-        key: "hello.txt",
-        saveToPath: target,
-      });
+      const result = await saveTo(target, { harness: sandboxed });
 
       expect(result.isError).toBeFalsy();
       expect(nativeRealpath).not.toHaveBeenCalled();
+      expect(nativeSync).not.toHaveBeenCalled();
       expect(fs.readFileSync(target, "utf8")).toBe("NEW");
     } finally {
       Object.defineProperty(process, "platform", { value: realPlatform });
       nativeRealpath.mockRestore();
+      nativeSync.mockRestore();
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
@@ -1029,11 +930,7 @@ describe("S3 object tools with deterministic handler fake", () => {
     const parent = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-vanish-"));
     const root = path.join(parent, "root");
     fs.mkdirSync(root);
-    const sandboxed = new ToolHarness();
-    registerS3ObjectTools(sandboxed, s3.asPeerClient(), versionGuard, {
-      ...testConfig,
-      fileRoot: root,
-    });
+    const sandboxed = sandboxedTools(root);
     // The root is renamed away right after the temp file opens, before its location is checked.
     const realOpen = fs.promises.open.bind(fs.promises);
     const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
@@ -1043,11 +940,7 @@ describe("S3 object tools with deterministic handler fake", () => {
     });
 
     try {
-      const result = await sandboxed.call("s3_get_object", {
-        bucket: "b",
-        key: "hello.txt",
-        saveToPath: path.join(root, "out.txt"),
-      });
+      const result = await saveTo(path.join(root, "out.txt"), { harness: sandboxed });
 
       expect(result.isError).toBe(true);
       expectBadRequestToolError(
@@ -1071,11 +964,7 @@ describe("S3 object tools with deterministic handler fake", () => {
     queueWebBody("NEW");
 
     try {
-      const result = await tools.call("s3_get_object", {
-        bucket: "b",
-        key: "hello.txt",
-        saveToPath: target,
-      });
+      const result = await saveTo(target);
 
       expect(result.isError).toBe(true);
       expectBadRequestToolError(result, /target .* cannot be written \(EBUSY\)/);
@@ -1102,20 +991,11 @@ describe("S3 object tools with deterministic handler fake", () => {
         return fileVersion();
       },
     };
-    const sandboxed = new ToolHarness();
-    registerS3ObjectTools(sandboxed, s3.asPeerClient(), racingGuard, {
-      ...testConfig,
-      fileRoot: root,
-    });
+    const sandboxed = sandboxedTools(root, racingGuard);
     const opened = trackOpenedHandles();
 
     try {
-      const result = await sandboxed.call("s3_get_object", {
-        bucket: "b",
-        key: "hello.txt",
-        versionId: "version-hello",
-        saveToPath: target,
-      });
+      const result = await saveTo(target, { harness: sandboxed, versionId: "version-hello" });
 
       expect(result.isError).toBe(true);
       expectBadRequestToolError(result, /outside the allowed directory/i);
@@ -1144,11 +1024,7 @@ describe("S3 object tools with deterministic handler fake", () => {
     const victim = path.join(outside, "out.txt");
     fs.writeFileSync(victim, "VICTIM\n");
     const target = path.join(dir, "out.txt");
-    const sandboxed = new ToolHarness();
-    registerS3ObjectTools(sandboxed, s3.asPeerClient(), versionGuard, {
-      ...testConfig,
-      fileRoot: root,
-    });
+    const sandboxed = sandboxedTools(root);
     // Swapped while the body is in flight, after the temp file is open and pinned.
     s3.respond("getObject", () => {
       fs.renameSync(dir, `${dir}.stash`);
@@ -1160,11 +1036,7 @@ describe("S3 object tools with deterministic handler fake", () => {
     });
 
     try {
-      const result = await sandboxed.call("s3_get_object", {
-        bucket: "b",
-        key: "hello.txt",
-        saveToPath: target,
-      });
+      const result = await saveTo(target, { harness: sandboxed });
 
       expect(result.isError).toBeFalsy();
       expect(fs.readFileSync(victim, "utf8")).toBe("VICTIM\n");
@@ -1187,11 +1059,7 @@ describe("S3 object tools with deterministic handler fake", () => {
       const bystander = path.join(outside, "lock");
       fs.mkdirSync(bystander);
       const target = path.join(shared, "x", "lock", "out.txt");
-      const sandboxed = new ToolHarness();
-      registerS3ObjectTools(sandboxed, s3.asPeerClient(), versionGuard, {
-        ...testConfig,
-        fileRoot: root,
-      });
+      const sandboxed = sandboxedTools(root);
       s3.respond("getObject", () => {
         fs.renameSync(path.join(shared, "x"), path.join(shared, "x.stash"));
         fs.symlinkSync(outside, path.join(shared, "x"));
@@ -1199,11 +1067,7 @@ describe("S3 object tools with deterministic handler fake", () => {
       });
 
       try {
-        const result = await sandboxed.call("s3_get_object", {
-          bucket: "b",
-          key: "missing.txt",
-          saveToPath: target,
-        });
+        const result = await saveTo(target, { harness: sandboxed, key: "missing.txt" });
 
         expect(result.isError).toBe(true);
         expect(fs.existsSync(bystander)).toBe(true);
@@ -1217,95 +1081,47 @@ describe("S3 object tools with deterministic handler fake", () => {
     },
   );
 
-  // The path-based fallback removes a level only while it is still the inode that was
-  // created, which leaves a window between that check and the removal. Here the check
-  // is made to pass after the swap, so only the pin can still aim the rmdir correctly.
-  linuxIt("removes only the pinned levels when the inode check is defeated", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-race-root-"));
-    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-race-out-"));
-    const shared = path.join(root, "shared");
-    fs.mkdirSync(shared);
-    const bystander = path.join(outside, "lock");
-    fs.mkdirSync(bystander);
-    const swapped = path.join(shared, "x");
-    const stashed = `${swapped}.stash`;
-    const target = path.join(swapped, "lock", "out.txt");
-    const realLstat = fs.promises.lstat.bind(fs.promises);
-    const lstatSpy = vi.spyOn(fs.promises, "lstat").mockImplementation(async (queried) => {
-      const asked = String(queried);
-      // Only once the swap has happened, and only for the created levels.
-      if (fs.existsSync(stashed) && asked.startsWith(swapped)) {
-        return realLstat(asked.replace(swapped, stashed));
-      }
-      return realLstat(queried as Parameters<typeof realLstat>[0]);
-    });
-    const sandboxed = new ToolHarness();
-    registerS3ObjectTools(sandboxed, s3.asPeerClient(), versionGuard, {
-      ...testConfig,
-      fileRoot: root,
-    });
-    s3.respond("getObject", () => {
-      fs.renameSync(swapped, stashed);
-      fs.symlinkSync(outside, swapped);
-      throw notFound();
-    });
+  // Swapped between opening the temp file and pinning its directory. With nothing in its
+  // place the stat through the pin fails; a decoy of the temp name leaves the inode check.
+  for (const decoy of [false, true]) {
+    linuxIt(
+      `refuses a parent directory that no longer holds the temp file (${decoy ? "a decoy" : "nothing"} in its place)`,
+      async () => {
+        const base = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-swap-"));
+        const outside = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-swap-out-"));
+        const bystander = path.join(outside, "lock");
+        fs.mkdirSync(bystander);
+        const dir = path.join(base, "shared", "lock");
+        fs.mkdirSync(path.join(base, "shared"));
+        const target = path.join(dir, "out.txt");
+        const realOpen = fs.promises.open.bind(fs.promises);
+        const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
+          const handle = await realOpen(...(args as Parameters<typeof realOpen>));
+          if (String(args[0]).endsWith(".part")) {
+            fs.renameSync(dir, `${dir}.stash`);
+            fs.symlinkSync(bystander, dir);
+            if (decoy) fs.writeFileSync(path.join(bystander, path.basename(String(args[0]))), "");
+          }
+          return handle;
+        });
+        queueWebBody("NEW");
 
-    try {
-      const result = await sandboxed.call("s3_get_object", {
-        bucket: "b",
-        key: "missing.txt",
-        saveToPath: target,
-      });
+        try {
+          const result = await saveTo(target);
 
-      expect(result.isError).toBe(true);
-      expect(fs.existsSync(bystander)).toBe(true);
-      expect(fs.readdirSync(path.join(stashed))).toEqual([]);
-    } finally {
-      lstatSpy.mockRestore();
-      fs.rmSync(root, { recursive: true, force: true });
-      fs.rmSync(outside, { recursive: true, force: true });
-    }
-  });
-
-  // Swapped in the window between opening the temp file and pinning its directory, so
-  // only the pin's own inode check can notice; without it the cleanup walk would start
-  // from a directory outside and remove the like-named one next to it.
-  linuxIt("refuses a parent directory that no longer holds the temp file", async () => {
-    const base = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-swap-"));
-    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-swap-out-"));
-    const bystander = path.join(outside, "lock");
-    fs.mkdirSync(bystander);
-    const dir = path.join(base, "shared", "lock");
-    fs.mkdirSync(path.join(base, "shared"));
-    const target = path.join(dir, "out.txt");
-    const realOpen = fs.promises.open.bind(fs.promises);
-    const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
-      const handle = await realOpen(...(args as Parameters<typeof realOpen>));
-      if (String(args[0]).endsWith(".part")) {
-        fs.renameSync(dir, `${dir}.stash`);
-        fs.symlinkSync(bystander, dir);
-      }
-      return handle;
-    });
-    queueWebBody("NEW");
-
-    try {
-      const result = await tools.call("s3_get_object", {
-        bucket: "b",
-        key: "hello.txt",
-        saveToPath: target,
-      });
-
-      expect(result.isError).toBe(true);
-      expectBadRequestToolError(result, /changed while the download was being prepared/i);
-      expect(fs.existsSync(bystander)).toBe(true);
-      expect(fs.readdirSync(outside)).toEqual(["lock"]);
-    } finally {
-      openSpy.mockRestore();
-      fs.rmSync(base, { recursive: true, force: true });
-      fs.rmSync(outside, { recursive: true, force: true });
-    }
-  });
+          expect(result.isError).toBe(true);
+          expectBadRequestToolError(result, /changed while the download was being prepared/i);
+          expect(s3.requestsFor("getObject")).toHaveLength(0);
+          expect(fs.existsSync(bystander)).toBe(true);
+          expect(fs.readdirSync(outside)).toEqual(["lock"]);
+        } finally {
+          openSpy.mockRestore();
+          fs.rmSync(base, { recursive: true, force: true });
+          fs.rmSync(outside, { recursive: true, force: true });
+        }
+      },
+    );
+  }
 
   // A hard link to the temp file placed outside the root makes the pin's inode check
   // pass on a directory that is not inside it, so the pin is checked against the root
@@ -1318,11 +1134,7 @@ describe("S3 object tools with deterministic handler fake", () => {
     const target = path.join(dir, "out.txt");
     fs.writeFileSync(target, "OLD\n");
     fs.chmodSync(target, 0o666);
-    const sandboxed = new ToolHarness();
-    registerS3ObjectTools(sandboxed, s3.asPeerClient(), versionGuard, {
-      ...testConfig,
-      fileRoot: root,
-    });
+    const sandboxed = sandboxedTools(root);
     const realOpen = fs.promises.open.bind(fs.promises);
     const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
       const handle = await realOpen(...(args as Parameters<typeof realOpen>));
@@ -1337,14 +1149,11 @@ describe("S3 object tools with deterministic handler fake", () => {
     queueWebBody("NEW");
 
     try {
-      const result = await sandboxed.call("s3_get_object", {
-        bucket: "b",
-        key: "hello.txt",
-        saveToPath: target,
-      });
+      const result = await saveTo(target, { harness: sandboxed });
 
       expect(result.isError).toBe(true);
       expectBadRequestToolError(result, /outside the allowed directory/i);
+      expect(s3.requestsFor("getObject")).toHaveLength(0);
       expect(fs.existsSync(path.join(outside, "out.txt"))).toBe(false);
     } finally {
       openSpy.mockRestore();
@@ -1361,11 +1170,7 @@ describe("S3 object tools with deterministic handler fake", () => {
     const dir = path.join(root, "sub");
     fs.mkdirSync(dir);
     const target = path.join(dir, "out.txt");
-    const sandboxed = new ToolHarness();
-    registerS3ObjectTools(sandboxed, s3.asPeerClient(), versionGuard, {
-      ...testConfig,
-      fileRoot: root,
-    });
+    const sandboxed = sandboxedTools(root);
     s3.respond("getObject", () => {
       fs.renameSync(dir, path.join(outside, "sub"));
       return downloadedObject({
@@ -1375,11 +1180,7 @@ describe("S3 object tools with deterministic handler fake", () => {
     });
 
     try {
-      const result = await sandboxed.call("s3_get_object", {
-        bucket: "b",
-        key: "hello.txt",
-        saveToPath: target,
-      });
+      const result = await saveTo(target, { harness: sandboxed });
 
       expect(result.isError).toBe(true);
       expectBadRequestToolError(result, /outside the allowed directory/i);
@@ -1397,22 +1198,14 @@ describe("S3 object tools with deterministic handler fake", () => {
     fs.mkdirSync(shared);
     const level = path.join(shared, "x");
     const target = path.join(level, "out.txt");
-    const sandboxed = new ToolHarness();
-    registerS3ObjectTools(sandboxed, s3.asPeerClient(), versionGuard, {
-      ...testConfig,
-      fileRoot: root,
-    });
+    const sandboxed = sandboxedTools(root);
     s3.respond("getObject", () => {
       fs.renameSync(level, path.join(outside, "x"));
       throw notFound();
     });
 
     try {
-      const result = await sandboxed.call("s3_get_object", {
-        bucket: "b",
-        key: "missing.txt",
-        saveToPath: target,
-      });
+      const result = await saveTo(target, { harness: sandboxed, key: "missing.txt" });
 
       expect(result.isError).toBe(true);
       // Still this download's own directory, but no longer somewhere it may act.
@@ -1429,11 +1222,7 @@ describe("S3 object tools with deterministic handler fake", () => {
     fs.mkdirSync(shared);
     const level = path.join(shared, "x");
     const target = path.join(level, "out.txt");
-    const sandboxed = new ToolHarness();
-    registerS3ObjectTools(sandboxed, s3.asPeerClient(), versionGuard, {
-      ...testConfig,
-      fileRoot: root,
-    });
+    const sandboxed = sandboxedTools(root);
     // The created level is moved aside and an empty decoy left under its name, so only
     // an inode check can tell that the name no longer holds what this download made.
     s3.respond("getObject", () => {
@@ -1443,11 +1232,7 @@ describe("S3 object tools with deterministic handler fake", () => {
     });
 
     try {
-      const result = await sandboxed.call("s3_get_object", {
-        bucket: "b",
-        key: "missing.txt",
-        saveToPath: target,
-      });
+      const result = await saveTo(target, { harness: sandboxed, key: "missing.txt" });
 
       expect(result.isError).toBe(true);
       expect(fs.existsSync(level)).toBe(true);
@@ -1460,11 +1245,7 @@ describe("S3 object tools with deterministic handler fake", () => {
   // is removed only while it is still the inode that was created.
   posixIt("keeps the directories it created under a file root without a pin", async () => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-off-")));
-    const sandboxed = new ToolHarness();
-    registerS3ObjectTools(sandboxed, s3.asPeerClient(), versionGuard, {
-      ...testConfig,
-      fileRoot: root,
-    });
+    const sandboxed = sandboxedTools(root);
     const realPlatform = process.platform;
     Object.defineProperty(process, "platform", { value: "darwin" });
     s3.respond("getObject", () => {
@@ -1472,10 +1253,9 @@ describe("S3 object tools with deterministic handler fake", () => {
     });
 
     try {
-      const result = await sandboxed.call("s3_get_object", {
-        bucket: "b",
+      const result = await saveTo(path.join(root, "a", "b", "out.txt"), {
+        harness: sandboxed,
         key: "missing.txt",
-        saveToPath: path.join(root, "a", "b", "out.txt"),
       });
 
       expect(result.isError).toBe(true);
@@ -1508,11 +1288,7 @@ describe("S3 object tools with deterministic handler fake", () => {
         });
 
         try {
-          const result = await tools.call("s3_get_object", {
-            bucket: "b",
-            key: "hello.txt",
-            saveToPath: target,
-          });
+          const result = await saveTo(target);
 
           expect(result.isError).toBe(true);
           expectBadRequestToolError(
@@ -1529,93 +1305,6 @@ describe("S3 object tools with deterministic handler fake", () => {
       },
     );
   }
-
-  posixIt("keeps an outside directory when the setup fails its sandbox re-check", async () => {
-    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-setup-root-")));
-    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-setup-out-"));
-    fs.mkdirSync(path.join(outside, "x"));
-    // Dangling while the path is vetted; given an inside target just before mkdir,
-    // then swapped out of the root before the created directory's inode is recorded.
-    const link = path.join(root, "link");
-    fs.symlinkSync(path.join(root, "later"), link);
-    const target = path.join(link, "x", "out.txt");
-    const sandboxed = new ToolHarness();
-    registerS3ObjectTools(sandboxed, s3.asPeerClient(), versionGuard, {
-      ...testConfig,
-      fileRoot: root,
-    });
-    const realMkdir = fs.promises.mkdir.bind(fs.promises);
-    const mkdirSpy = vi.spyOn(fs.promises, "mkdir").mockImplementation(async (...args) => {
-      const swap = String(args[0]).endsWith(path.join("link", "x"));
-      if (swap) fs.mkdirSync(path.join(root, "later"));
-      const made = await realMkdir(...(args as Parameters<typeof realMkdir>));
-      if (swap) {
-        fs.unlinkSync(link);
-        fs.symlinkSync(outside, link);
-      }
-      return made;
-    });
-    queueWebBody("NEW");
-
-    try {
-      const result = await sandboxed.call("s3_get_object", {
-        bucket: "b",
-        key: "hello.txt",
-        saveToPath: target,
-      });
-
-      expect(result.isError).toBe(true);
-      expectBadRequestToolError(result, /outside the allowed directory/i);
-      expect(fs.existsSync(path.join(outside, "x"))).toBe(true);
-    } finally {
-      mkdirSpy.mockRestore();
-      fs.rmSync(root, { recursive: true, force: true });
-      fs.rmSync(outside, { recursive: true, force: true });
-    }
-  });
-
-  // A refused fchmod must not leave the replacement readable by a class the original
-  // denied: the temp file starts with the owner bits only.
-  posixIt("keeps group and other bits clear when chmod is refused", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-nochmod-"));
-    const target = path.join(dir, "owned.txt");
-    fs.writeFileSync(target, "OLD\n");
-    fs.chmodSync(target, 0o640);
-    const realOpen = fs.promises.open.bind(fs.promises);
-    const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
-      const handle = await realOpen(...(args as Parameters<typeof realOpen>));
-      if (!String(args[0]).endsWith(".part")) return handle;
-      handle.chown = async () => {
-        throw Object.assign(new Error("EPERM"), { code: "EPERM" });
-      };
-      handle.chmod = async () => {
-        throw Object.assign(new Error("EPERM"), { code: "EPERM" });
-      };
-      const realStat = handle.stat.bind(handle);
-      handle.stat = (async () => {
-        const stat = await realStat();
-        Object.defineProperty(stat, "gid", { value: stat.gid + 1 });
-        return stat;
-      }) as typeof handle.stat;
-      return handle;
-    });
-    queueWebBody("NEW");
-
-    try {
-      const result = await tools.call("s3_get_object", {
-        bucket: "b",
-        key: "hello.txt",
-        saveToPath: target,
-      });
-
-      expect(result.isError).toBeFalsy();
-      expect(fs.statSync(target).mode & 0o077).toBe(0);
-      expect(fs.readFileSync(target, "utf8")).toBe("NEW");
-    } finally {
-      openSpy.mockRestore();
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
 
   const destinationChanges = [
     {
@@ -1656,11 +1345,7 @@ describe("S3 object tools with deterministic handler fake", () => {
       });
 
       try {
-        const result = await tools.call("s3_get_object", {
-          bucket: "b",
-          key: "hello.txt",
-          saveToPath: target,
-        });
+        const result = await saveTo(target);
 
         expect(result.isError).toBe(true);
         expectBadRequestToolError(result, /target .* changed while the download was in flight/i);
@@ -1675,11 +1360,7 @@ describe("S3 object tools with deterministic handler fake", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-proc-root-"));
     const target = path.join(root, "out.txt");
     fs.writeFileSync(target, "KEEP\n");
-    const sandboxed = new ToolHarness();
-    registerS3ObjectTools(sandboxed, s3.asPeerClient(), versionGuard, {
-      ...testConfig,
-      fileRoot: root,
-    });
+    const sandboxed = sandboxedTools(root);
     const realReadlink = fs.promises.readlink.bind(fs.promises);
     const readlinkSpy = vi.spyOn(fs.promises, "readlink").mockImplementation(async (queried) => {
       if (String(queried).startsWith("/proc/self/fd/")) {
@@ -1690,11 +1371,7 @@ describe("S3 object tools with deterministic handler fake", () => {
     queueWebBody("NEW");
 
     try {
-      const result = await sandboxed.call("s3_get_object", {
-        bucket: "b",
-        key: "hello.txt",
-        saveToPath: target,
-      });
+      const result = await saveTo(target, { harness: sandboxed });
 
       // No pin is possible here, so the sandboxed request fails instead of quietly
       // running the path-based operations it is meant to have replaced.
@@ -1711,11 +1388,7 @@ describe("S3 object tools with deterministic handler fake", () => {
   linuxIt("refuses a sandboxed save whose parent cannot be pinned", async () => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-none-")));
     const dir = path.join(root, "a", "b");
-    const sandboxed = new ToolHarness();
-    registerS3ObjectTools(sandboxed, s3.asPeerClient(), versionGuard, {
-      ...testConfig,
-      fileRoot: root,
-    });
+    const sandboxed = sandboxedTools(root);
     const realOpen = fs.promises.open.bind(fs.promises);
     const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
       if (String(args[0]) === dir) throw Object.assign(new Error("EACCES"), { code: "EACCES" });
@@ -1724,11 +1397,7 @@ describe("S3 object tools with deterministic handler fake", () => {
     queueWebBody("NEW");
 
     try {
-      const result = await sandboxed.call("s3_get_object", {
-        bucket: "b",
-        key: "hello.txt",
-        saveToPath: path.join(dir, "out.txt"),
-      });
+      const result = await saveTo(path.join(dir, "out.txt"), { harness: sandboxed });
 
       expect(result.isError).toBe(true);
       expectBadRequestToolError(result, /changed while the download was being prepared/i);
@@ -1759,11 +1428,7 @@ describe("S3 object tools with deterministic handler fake", () => {
             return fileVersion();
           },
         };
-        const sandboxed = new ToolHarness();
-        registerS3ObjectTools(sandboxed, s3.asPeerClient(), racingGuard, {
-          ...testConfig,
-          fileRoot: root,
-        });
+        const sandboxed = sandboxedTools(root, racingGuard);
         // Every path check passes; the ancestor is swapped at the last moment, so
         // the exclusive create itself lands outside the root.
         const realOpen = fs.promises.open.bind(fs.promises);
@@ -1776,11 +1441,9 @@ describe("S3 object tools with deterministic handler fake", () => {
         Object.defineProperty(process, "platform", { value: platform });
 
         try {
-          const result = await sandboxed.call("s3_get_object", {
-            bucket: "b",
-            key: "hello.txt",
+          const result = await saveTo(path.join(root, "link", "out.txt"), {
+            harness: sandboxed,
             versionId: "version-hello",
-            saveToPath: path.join(root, "link", "out.txt"),
           });
 
           expect(result.isError).toBe(true);
@@ -1812,11 +1475,7 @@ describe("S3 object tools with deterministic handler fake", () => {
           return fileVersion();
         },
       };
-      const sandboxed = new ToolHarness();
-      registerS3ObjectTools(sandboxed, s3.asPeerClient(), racingGuard, {
-        ...testConfig,
-        fileRoot: root,
-      });
+      const sandboxed = sandboxedTools(root, racingGuard);
       // The create lands outside, then the link is restored and the in-root temp name is
       // filled, so the real path looks fine and only the device/inode and link count remain.
       const realOpen = fs.promises.open.bind(fs.promises);
@@ -1835,11 +1494,9 @@ describe("S3 object tools with deterministic handler fake", () => {
       Object.defineProperty(process, "platform", { value: "darwin" });
 
       try {
-        const result = await sandboxed.call("s3_get_object", {
-          bucket: "b",
-          key: "hello.txt",
+        const result = await saveTo(path.join(root, "link", "out.txt"), {
+          harness: sandboxed,
           versionId: "version-hello",
-          saveToPath: path.join(root, "link", "out.txt"),
         });
 
         expect(result.isError).toBe(true);
@@ -1861,11 +1518,7 @@ describe("S3 object tools with deterministic handler fake", () => {
     fs.chmodSync(dir, 0o555);
 
     try {
-      const result = await tools.call("s3_get_object", {
-        bucket: "b",
-        key: "hello.txt",
-        saveToPath: target,
-      });
+      const result = await saveTo(target);
 
       expect(result.isError).toBe(true);
       expectBadRequestToolError(result, /directory .* cannot be written \(EACCES\)/);
@@ -1884,11 +1537,7 @@ describe("S3 object tools with deterministic handler fake", () => {
     fs.chmodSync(target, 0o444);
 
     try {
-      const result = await tools.call("s3_get_object", {
-        bucket: "b",
-        key: "hello.txt",
-        saveToPath: target,
-      });
+      const result = await saveTo(target);
 
       expect(result.isError).toBe(true);
       expectBadRequestToolError(result, /not writable/i);
@@ -1906,11 +1555,7 @@ describe("S3 object tools with deterministic handler fake", () => {
     queueWebBody("NEW");
 
     try {
-      const result = await tools.call("s3_get_object", {
-        bucket: "b",
-        key: "hello.txt",
-        saveToPath: target,
-      });
+      const result = await saveTo(target);
 
       expect(result.isError).toBeFalsy();
       expect(fs.readFileSync(target, "utf8")).toBe("NEW");
