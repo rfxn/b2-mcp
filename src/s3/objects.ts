@@ -5,6 +5,7 @@
  */
 
 import type { ReadableStream as WebReadableStream } from "node:stream/web";
+import { randomBytes } from "crypto";
 import * as fs from "fs";
 import * as path from "path";
 import { Readable, Transform } from "stream";
@@ -21,6 +22,7 @@ import { timeoutError } from "../utils/named-error.js";
 import type { B2Config, B2S3FileVersionBinding, B2S3VersionGuard } from "../utils/types.js";
 import type {
   B2S3DeleteObjectsResult,
+  B2S3DownloadedObject,
   B2S3HeadObjectResult,
   B2S3ObjectBody,
   B2S3PeerClient,
@@ -139,15 +141,20 @@ function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
 
 async function pipelineBodyToFileWithIdleTimeout(
   body: B2S3ObjectBody,
-  writeStream: fs.WriteStream,
-): Promise<void> {
+  openWriteStream: () => fs.WriteStream,
+): Promise<number> {
   const source = nodeReadableFromBody(body);
+  // Opened only once the body is known to be readable, so a rejected body never
+  // strands a stream that holds the destination file open.
+  const writeStream = openWriteStream();
   const timeoutMs = saveToPathIdleTimeoutMs();
   let timer: ReturnType<typeof setTimeout> | undefined;
   let timeoutFailure: Error | null = null;
+  let bytesWritten = 0;
   const progress = new Transform({
-    transform(chunk, _encoding, callback) {
+    transform(chunk: Buffer, _encoding, callback) {
       armIdleTimer();
+      bytesWritten += chunk.byteLength;
       callback(null, chunk);
     },
   });
@@ -173,6 +180,7 @@ async function pipelineBodyToFileWithIdleTimeout(
   armIdleTimer();
   try {
     await pipeline(source, progress, writeStream);
+    return bytesWritten;
   } catch (err) {
     if (timeoutFailure) {
       await cancelBody(body, timeoutFailure);
@@ -181,6 +189,212 @@ async function pipelineBodyToFileWithIdleTimeout(
     throw err;
   } finally {
     clearIdleTimer();
+  }
+}
+
+/** Local destination for an `s3_get_object` saveToPath download. */
+interface SaveToPathTarget {
+  /** Final path the completed download is renamed onto. */
+  path: string;
+  /** Metadata of the regular file being replaced, or undefined for a new file. */
+  existing: { mode: number; uid: number; gid: number } | undefined;
+}
+
+/** Errno codes that mean the caller named a local path this process cannot write. */
+const NOT_WRITABLE_CODES = new Set([
+  "EACCES",
+  "EPERM",
+  "EROFS",
+  "ENOTDIR",
+  "EISDIR",
+  "ENOTEMPTY",
+  "ELOOP",
+  "ENAMETOOLONG",
+  "ENOENT",
+  "EBUSY",
+  "EXDEV",
+]);
+
+/** Map a local permission/shape failure to a correctable bad_request; rethrow the rest. */
+function notWritableError(err: unknown, what: string): unknown {
+  const code = (err as NodeJS.ErrnoException | null)?.code;
+  return code && NOT_WRITABLE_CODES.has(code)
+    ? badRequestError(`saveToPath ${what} cannot be written (${code}).`)
+    : err;
+}
+
+/**
+ * Resolve and vet a saveToPath destination before any bytes are fetched. An
+ * existing symlink is followed so the download replaces the file it points at,
+ * not the link; a dangling link is replaced itself, never followed. Only
+ * writable regular files may be replaced: a directory, device, FIFO, or socket
+ * would be swapped out wholesale by the final rename.
+ */
+async function prepareSaveToPathTarget(
+  safePath: string,
+  sandboxed: boolean,
+): Promise<SaveToPathTarget> {
+  // A sandboxed path was already resolved (and root-checked) by resolveLocalPath;
+  // resolving it again could follow a link changed to point outside the root meanwhile.
+  const target = sandboxed ? safePath : await fs.promises.realpath(safePath).catch(() => safePath);
+  let stat: fs.Stats;
+  try {
+    stat = await fs.promises.stat(target);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return { path: target, existing: undefined };
+    }
+    throw notWritableError(err, `target '${target}'`);
+  }
+  if (!stat.isFile()) {
+    throw badRequestError(
+      `saveToPath must name a regular file; '${target}' is ${stat.isDirectory() ? "a directory" : "not a regular file"}.`,
+    );
+  }
+  // The rename needs only directory write access; keep a read-only file protected
+  // exactly as the former in-place overwrite did.
+  try {
+    await fs.promises.access(target, fs.constants.W_OK);
+  } catch {
+    throw badRequestError(`saveToPath target '${target}' exists and is not writable.`);
+  }
+  // Permission bits only: setuid/setgid/sticky are not carried onto new remote content.
+  return { path: target, existing: { mode: stat.mode & 0o777, uid: stat.uid, gid: stat.gid } };
+}
+
+/**
+ * Best-effort owner/group carry-over for a replaced file. Root keeps both; any
+ * other user keeps the group when it is a member. Refusals are expected and
+ * leave the process defaults, which is what a brand-new file would get.
+ */
+async function preserveOwnership(
+  handle: fs.promises.FileHandle,
+  existing: { uid: number; gid: number },
+): Promise<void> {
+  if (process.platform === "win32") return;
+  try {
+    await handle.chown(existing.uid, existing.gid);
+  } catch {
+    await handle.chown(-1, existing.gid).catch(() => undefined);
+  }
+}
+
+/** Longest prefix of `name` within `maxBytes` of UTF-8 that never splits a character. */
+function utf8Prefix(name: string, maxBytes: number): string {
+  let prefix = "";
+  let bytes = 0;
+  for (const char of name) {
+    bytes += Buffer.byteLength(char);
+    if (bytes > maxBytes) break;
+    prefix += char;
+  }
+  return prefix;
+}
+
+/** Remove directories this download created, deepest first, stopping at any non-empty one. */
+async function removeCreatedDirs(dir: string, firstCreated: string | undefined): Promise<void> {
+  if (!firstCreated) return;
+  for (let current = dir; ; current = path.dirname(current)) {
+    try {
+      await fs.promises.rmdir(current);
+    } catch {
+      return;
+    }
+    if (current === firstCreated || path.dirname(current) === current) return;
+  }
+}
+
+/**
+ * Download an object into `target` through an exclusively created sibling temp
+ * file that is renamed into place only after the full, length-verified body is
+ * synced to disk and closed. The temp file (and any missing parent directory)
+ * is created before the object is requested, so local setup problems fail
+ * before any bytes are fetched and never count against the S3 transfer circuit.
+ * Every exit path closes the handle, removes the temp file and any directories
+ * it created, and cancels an unconsumed body, so a failed or interrupted
+ * transfer leaves the filesystem as it was.
+ *
+ * @returns The number of bytes saved.
+ */
+async function downloadToPath(
+  target: SaveToPathTarget,
+  fetchObject: () => Promise<B2S3DownloadedObject>,
+): Promise<number> {
+  const dir = path.dirname(target.path);
+  // At most 64 UTF-8 bytes of the name plus the 24-byte suffix keeps the temp
+  // name far below the common 255-byte NAME_MAX for any target name.
+  const tempPath = path.join(
+    dir,
+    `${utf8Prefix(path.basename(target.path), 64)}.b2mcp-${randomBytes(6).toString("hex")}.part`,
+  );
+  let firstCreatedDir: string | undefined;
+  let handle: fs.promises.FileHandle;
+  try {
+    firstCreatedDir = await fs.promises.mkdir(dir, { recursive: true });
+    // "wx" is O_CREAT|O_EXCL: never follows or reuses an existing path. Creating
+    // with the replaced file's bits (umask only narrows them) keeps private
+    // contents from ever being more readable than the file they replace.
+    handle = await fs.promises.open(tempPath, "wx", target.existing?.mode ?? 0o666);
+  } catch (err) {
+    await removeCreatedDirs(dir, firstCreatedDir);
+    throw notWritableError(err, `directory '${dir}'`);
+  }
+
+  let body: B2S3ObjectBody | undefined;
+  let writeStream: fs.WriteStream | undefined;
+  let committed = false;
+  try {
+    // Owner and mode are set before any byte lands, so the contents are never
+    // exposed under looser metadata than the file they replace.
+    if (target.existing) {
+      await preserveOwnership(handle, target.existing);
+      // Best effort, like ownership: FAT and SMB mounts may refuse
+      // fchmod, and the temp file was already created no wider than this mode.
+      await handle.chmod(target.existing.mode).catch(() => undefined);
+    }
+    const object = await fetchObject();
+    body = object.body;
+    const bytes = await withS3LongCircuit(async () => {
+      const written = await withBodyReadAbort(object.body, () =>
+        pipelineBodyToFileWithIdleTimeout(object.body, () => {
+          // The stream takes ownership of the handle: flush syncs it to disk and the
+          // stream closes it once the pipeline finishes or is destroyed.
+          writeStream = handle.createWriteStream({ flush: true });
+          return writeStream;
+        }),
+      );
+      // A body that ends cleanly but short must never replace a good file.
+      if (Number.isFinite(object.contentLength) && written !== object.contentLength) {
+        throw codedError(
+          502,
+          "incomplete_download",
+          `Object body ended after ${written} of ${object.contentLength} bytes; '${target.path}' was left unchanged.`,
+        );
+      }
+      return written;
+    });
+    try {
+      await fs.promises.rename(tempPath, target.path);
+    } catch (err) {
+      // e.g. a sticky directory, an append-only file, or a Windows file lock.
+      throw notWritableError(err, `target '${target.path}'`);
+    }
+    committed = true;
+    return bytes;
+  } catch (err) {
+    // No reason: destroying an unconsumed Node body with an error would emit an
+    // unhandled 'error' event when a failure lands before the pipeline attaches.
+    if (body) await cancelBody(body);
+    throw err;
+  } finally {
+    // Destroying the stream releases its hold on the handle; close() then waits
+    // for in-flight writes and is a no-op if the stream already closed it.
+    writeStream?.destroy();
+    await handle.close().catch(() => undefined);
+    if (!committed) {
+      await fs.promises.unlink(tempPath).catch(() => undefined);
+      await removeCreatedDirs(dir, firstCreatedDir);
+    }
   }
 }
 
@@ -567,7 +781,7 @@ export function registerS3ObjectTools(
     "s3_get_object",
     {
       description:
-        "Read a SMALL object inline (≤1 MiB, returned base64) — for manifests, sidecars, and configs the agent must inspect — or stream any size to a local path with saveToPath. saveToPath writes the fetched bytes to the local filesystem (creating parent directories), removes the partial file if the stream fails (cleanup of its own output only), and performs no mutation of B2 or any remote data. For real object data, generate a GetObject URL with s3_get_presigned_url and download directly from B2 (bytes never pass through the server or the model context).",
+        "Read a SMALL object inline (≤1 MiB, returned base64) — for manifests, sidecars, and configs the agent must inspect — or stream any size to a local path with saveToPath. saveToPath writes the fetched bytes to the local filesystem (creating parent directories) via a temporary sibling file that replaces the target only after a complete download, so a failed transfer leaves any existing file untouched; it performs no mutation of B2 or any remote data. For real object data, generate a GetObject URL with s3_get_presigned_url and download directly from B2 (bytes never pass through the server or the model context).",
       inputSchema: {
         bucket: z.string().describe("The bucket name."),
         key: z.string().describe("The object key."),
@@ -581,6 +795,14 @@ export function registerS3ObjectTools(
     },
     async (args) => {
       try {
+        // Vet the local destination before any network call, so a rejected path
+        // never leaves an open object body behind.
+        const saveTarget = args.saveToPath
+          ? await prepareSaveToPathTarget(
+              resolveLocalPath(config, args.saveToPath, "write"),
+              Boolean(config.fileRoot),
+            )
+          : undefined;
         await verifyVersionBinding(
           versions,
           {
@@ -590,32 +812,21 @@ export function registerS3ObjectTools(
           },
           { allowExplicitVersionInspection },
         );
-        const result = await s3.getObject({
-          bucket: args.bucket,
-          key: args.key,
-          range: args.range,
-          versionId: args.versionId,
-        });
+        const getObject = () =>
+          s3.getObject({
+            bucket: args.bucket,
+            key: args.key,
+            range: args.range,
+            versionId: args.versionId,
+          });
 
         // Stream straight to disk for saveToPath — no full-object buffering.
-        if (args.saveToPath) {
-          const safePath = resolveLocalPath(config, args.saveToPath, "write");
-          fs.mkdirSync(path.dirname(safePath), { recursive: true });
-          const writeStream = fs.createWriteStream(safePath);
-          try {
-            await withS3LongCircuit(() =>
-              withBodyReadAbort(result.body, () =>
-                pipelineBodyToFileWithIdleTimeout(result.body, writeStream),
-              ),
-            );
-          } catch (e) {
-            await fs.promises.unlink(safePath).catch(() => undefined);
-            throw e;
-          }
-          return toolSuccess(
-            `Object saved to ${safePath} (${result.contentLength ?? "unknown"} bytes)`,
-          );
+        if (saveTarget) {
+          const bytes = await downloadToPath(saveTarget, getObject);
+          return toolSuccess(`Object saved to ${saveTarget.path} (${bytes} bytes)`);
         }
+
+        const result = await getObject();
 
         // Bound the inline path: without saveToPath the whole object is buffered
         // and base64-copied into the response (and the model context), so this is

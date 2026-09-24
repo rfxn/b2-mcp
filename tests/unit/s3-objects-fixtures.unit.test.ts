@@ -87,6 +87,7 @@ function notFound(message = "Object not found") {
 describe("S3 object tools with deterministic handler fake", () => {
   let tools: ToolHarness;
   let s3: DeterministicS3ClientFake;
+  let versionGuard: B2S3VersionGuard;
   let currentVersion: B2S3FileVersionBinding | null = null;
   let nextCurrentVersionError: unknown = null;
   let nextBulkVersionLookupError: unknown = null;
@@ -113,7 +114,7 @@ describe("S3 object tools with deterministic handler fake", () => {
     nextBulkVersionLookupError = null;
     versions.clear();
     bulkVersionLookups = [];
-    const versionGuard: B2S3VersionGuard = {
+    versionGuard = {
       async resolveS3FileVersion(input: { bucket: string; key: string; versionId: string }) {
         const version = versions.get(input.versionId);
         if (
@@ -382,7 +383,7 @@ describe("S3 object tools with deterministic handler fake", () => {
     expect(parseResult(large)).toMatch(/saveToPath/);
   });
 
-  it("streams saveToPath downloads to disk and reports unknown length", async () => {
+  it("streams saveToPath downloads to disk and reports the bytes written", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-ok-"));
     const target = path.join(dir, "nested", "out.txt");
     queueGetObject({
@@ -406,7 +407,7 @@ describe("S3 object tools with deterministic handler fake", () => {
       });
 
       expect(result.isError).toBeFalsy();
-      expect(parseResult(result)).toContain("unknown bytes");
+      expect(parseResult(result)).toContain("(20 bytes)");
       expect(fs.readFileSync(target, "utf8")).toBe("saved through stream");
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -474,6 +475,467 @@ describe("S3 object tools with deterministic handler fake", () => {
     } finally {
       if (previousTimeout === undefined) delete process.env.B2_S3_SAVE_TO_PATH_IDLE_TIMEOUT_MS;
       else process.env.B2_S3_SAVE_TO_PATH_IDLE_TIMEOUT_MS = previousTimeout;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves a pre-existing file when a saveToPath download fails", async () => {
+    const previousTimeout = process.env.B2_S3_SAVE_TO_PATH_IDLE_TIMEOUT_MS;
+    process.env.B2_S3_SAVE_TO_PATH_IDLE_TIMEOUT_MS = "20";
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-keep-"));
+    const target = path.join(dir, "important.txt");
+    fs.writeFileSync(target, "ORIGINAL-IMPORTANT-DATA\n");
+    let pushed = false;
+    const body = new Readable({
+      read() {
+        if (pushed) return;
+        pushed = true;
+        this.push(Buffer.from("partial"));
+      },
+    });
+    queueGetObject({ contentLength: 100, body: body as B2S3DownloadedObject["body"] });
+
+    try {
+      const result = await tools.call("s3_get_object", {
+        bucket: "b",
+        key: "hello.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBe(true);
+      expect(fs.readFileSync(target, "utf8")).toBe("ORIGINAL-IMPORTANT-DATA\n");
+      expect(fs.readdirSync(dir)).toEqual(["important.txt"]);
+    } finally {
+      if (previousTimeout === undefined) delete process.env.B2_S3_SAVE_TO_PATH_IDLE_TIMEOUT_MS;
+      else process.env.B2_S3_SAVE_TO_PATH_IDLE_TIMEOUT_MS = previousTimeout;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("replaces a pre-existing file after a successful saveToPath download", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-replace-"));
+    const target = path.join(dir, "out.txt");
+    fs.writeFileSync(target, "OLD-CONTENT\n");
+    queueGetObject({
+      contentLength: undefined,
+      body: {
+        transformToWebStream: () =>
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode("NEW-CONTENT"));
+              controller.close();
+            },
+          }),
+      } as unknown as B2S3DownloadedObject["body"],
+    });
+
+    try {
+      const result = await tools.call("s3_get_object", {
+        bucket: "b",
+        key: "hello.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(fs.readFileSync(target, "utf8")).toBe("NEW-CONTENT");
+      expect(fs.readdirSync(dir)).toEqual(["out.txt"]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  function queueWebBody(text: string) {
+    queueGetObject({
+      contentLength: undefined,
+      body: {
+        transformToWebStream: () =>
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode(text));
+              controller.close();
+            },
+          }),
+      } as unknown as B2S3DownloadedObject["body"],
+    });
+  }
+
+  const posixIt = process.platform === "win32" ? it.skip : it;
+  const nonRootPosixIt = process.platform === "win32" || process.getuid?.() === 0 ? it.skip : it;
+  const rootPosixIt = process.platform !== "win32" && process.getuid?.() === 0 ? it : it.skip;
+
+  posixIt("preserves the permission bits of a replaced saveToPath file", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-mode-"));
+    const target = path.join(dir, "secret.env");
+    fs.writeFileSync(target, "OLD\n", { mode: 0o600 });
+    fs.chmodSync(target, 0o600);
+    queueWebBody("NEW");
+
+    try {
+      const result = await tools.call("s3_get_object", {
+        bucket: "b",
+        key: "hello.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(fs.readFileSync(target, "utf8")).toBe("NEW");
+      expect(fs.statSync(target).mode & 0o777).toBe(0o600);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  posixIt(
+    "writes through a symlinked saveToPath target instead of replacing the link",
+    async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-link-"));
+      const real = path.join(dir, "real.txt");
+      const link = path.join(dir, "link.txt");
+      fs.writeFileSync(real, "OLD\n");
+      fs.symlinkSync(real, link);
+      queueWebBody("NEW");
+
+      try {
+        const result = await tools.call("s3_get_object", {
+          bucket: "b",
+          key: "hello.txt",
+          saveToPath: link,
+        });
+
+        expect(result.isError).toBeFalsy();
+        expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+        expect(fs.readFileSync(real, "utf8")).toBe("NEW");
+        expect(fs.readdirSync(dir).sort()).toEqual(["link.txt", "real.txt"]);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("saves to targets whose names are too long for a suffixed temp name", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-long-"));
+    const name = `${"x".repeat(240)}.txt`;
+    const target = path.join(dir, name);
+    queueWebBody("NEW");
+
+    try {
+      const result = await tools.call("s3_get_object", {
+        bucket: "b",
+        key: "hello.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(fs.readFileSync(target, "utf8")).toBe("NEW");
+      expect(fs.readdirSync(dir)).toEqual([name]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a directory saveToPath target before fetching the object", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-dir-"));
+    const target = path.join(dir, "existing-dir");
+    fs.mkdirSync(target);
+
+    try {
+      const result = await tools.call("s3_get_object", {
+        bucket: "b",
+        key: "hello.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBe(true);
+      expectBadRequestToolError(result, /regular file.*directory/i);
+      expect(s3.requestsFor("getObject")).toHaveLength(0);
+      expect(fs.statSync(target).isDirectory()).toBe(true);
+      expect(fs.readdirSync(dir)).toEqual(["existing-dir"]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  /** Capture every file handle the tool opens so tests can prove each was closed. */
+  function trackOpenedHandles(): {
+    handles: fs.promises.FileHandle[];
+    paths: string[];
+    restore: () => void;
+  } {
+    const handles: fs.promises.FileHandle[] = [];
+    const paths: string[] = [];
+    const realOpen = fs.promises.open.bind(fs.promises);
+    const spy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
+      const handle = await realOpen(...(args as Parameters<typeof realOpen>));
+      handles.push(handle);
+      paths.push(String(args[0]));
+      return handle;
+    });
+    return { handles, paths, restore: () => spy.mockRestore() };
+  }
+
+  it("bounds the temp name by UTF-8 bytes without splitting characters", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-utf8-"));
+    // 60 four-byte characters: 244 bytes, a valid name close to NAME_MAX.
+    const name = `${"\u{1F600}".repeat(60)}.txt`;
+    const target = path.join(dir, name);
+    const opened = trackOpenedHandles();
+    queueWebBody("NEW");
+
+    try {
+      const result = await tools.call("s3_get_object", {
+        bucket: "b",
+        key: "hello.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBeFalsy();
+      const tempName = path.basename(opened.paths[0] ?? "");
+      expect(tempName.startsWith(`${"\u{1F600}".repeat(16)}.b2mcp-`)).toBe(true);
+      expect(tempName).not.toContain("\uFFFD");
+      expect(Buffer.byteLength(tempName)).toBe(64 + 24);
+      expect(fs.readdirSync(dir)).toEqual([name]);
+    } finally {
+      opened.restore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves no temp file, open handle, or created directory when the body is missing", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-nobody-"));
+    const target = path.join(dir, "a", "b", "out.txt");
+    const opened = trackOpenedHandles();
+    queueGetObject({ contentLength: 5, body: undefined });
+
+    try {
+      const result = await tools.call("s3_get_object", {
+        bucket: "b",
+        key: "hello.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBe(true);
+      expect(parseResult(result)).toMatch(/readable body/i);
+      expect(opened.handles).toHaveLength(1);
+      expect(opened.handles[0]?.fd).toBe(-1);
+      expect(fs.readdirSync(dir)).toEqual([]);
+    } finally {
+      opened.restore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("removes directories it created when the object fetch fails", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-404-"));
+    fs.mkdirSync(path.join(dir, "keep"));
+    const target = path.join(dir, "keep", "new", "deeper", "out.txt");
+    s3.respond("getObject", notFound());
+
+    try {
+      const result = await tools.call("s3_get_object", {
+        bucket: "b",
+        key: "missing.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBe(true);
+      expect(fs.readdirSync(dir)).toEqual(["keep"]);
+      expect(fs.readdirSync(path.join(dir, "keep"))).toEqual([]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("cancels the body and closes the temp file when the transfer circuit is open", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-breaker-"));
+    const target = path.join(dir, "out.txt");
+    fs.writeFileSync(target, "KEEP\n");
+    const body = new Readable({
+      read() {
+        // Never produces data: the transfer must be refused before it is read.
+      },
+    });
+    queueGetObject({ contentLength: 5, body: body as B2S3DownloadedObject["body"] });
+    const opened = trackOpenedHandles();
+    s3TransferCircuitBreaker.open();
+
+    try {
+      const result = await tools.call("s3_get_object", {
+        bucket: "b",
+        key: "hello.txt",
+        saveToPath: target,
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(result.isError).toBe(true);
+      expect(body.destroyed).toBe(true);
+      expect(opened.handles).toHaveLength(1);
+      expect(opened.handles[0]?.fd).toBe(-1);
+      expect(fs.readFileSync(target, "utf8")).toBe("KEEP\n");
+      expect(fs.readdirSync(dir)).toEqual(["out.txt"]);
+    } finally {
+      s3TransferCircuitBreaker.close();
+      opened.restore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the existing file when the body ends before its content length", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-short-"));
+    const target = path.join(dir, "out.txt");
+    fs.writeFileSync(target, "KEEP\n");
+    queueGetObject({
+      contentLength: 100,
+      body: Readable.from([Buffer.from("trunc")]) as B2S3DownloadedObject["body"],
+    });
+
+    try {
+      const result = await tools.call("s3_get_object", {
+        bucket: "b",
+        key: "hello.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBe(true);
+      const errorText = parseResult(result) as string;
+      expect(errorText).toMatch(/5 of 100 bytes/);
+      expect(parseErrorText(errorText)).toMatchObject({
+        code: "incomplete_download",
+        status: 502,
+      });
+      expect(fs.readFileSync(target, "utf8")).toBe("KEEP\n");
+      expect(fs.readdirSync(dir)).toEqual(["out.txt"]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  rootPosixIt("preserves the owner and group of a replaced saveToPath file", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-owner-"));
+    const target = path.join(dir, "shared.txt");
+    fs.writeFileSync(target, "OLD\n");
+    fs.chownSync(target, 12345, 23456);
+    fs.chmodSync(target, 0o640);
+    queueWebBody("NEW");
+
+    try {
+      const result = await tools.call("s3_get_object", {
+        bucket: "b",
+        key: "hello.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBeFalsy();
+      const stat = fs.statSync(target);
+      expect([stat.uid, stat.gid, stat.mode & 0o777]).toEqual([12345, 23456, 0o640]);
+      expect(fs.readFileSync(target, "utf8")).toBe("NEW");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  posixIt("replaces a dangling symlink inside the file root instead of following it", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-root-"));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-outside-"));
+    const escapeTarget = path.join(outside, "escaped.txt");
+    const link = path.join(root, "link.txt");
+    fs.symlinkSync(escapeTarget, link);
+    const sandboxed = new ToolHarness();
+    registerS3ObjectTools(sandboxed, s3.asPeerClient(), versionGuard, {
+      ...testConfig,
+      fileRoot: root,
+    });
+    queueWebBody("NEW");
+
+    try {
+      const result = await sandboxed.call("s3_get_object", {
+        bucket: "b",
+        key: "hello.txt",
+        saveToPath: link,
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(fs.existsSync(escapeTarget)).toBe(false);
+      expect(fs.lstatSync(link).isFile()).toBe(true);
+      expect(fs.readFileSync(link, "utf8")).toBe("NEW");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("reports a failed final rename as bad_request and keeps the destination", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-rename-"));
+    const target = path.join(dir, "out.txt");
+    fs.writeFileSync(target, "OLD\n");
+    // The destination turns into a non-empty directory mid-download, so the
+    // rename fails only after the whole body has been written.
+    s3.respond("getObject", () => {
+      fs.rmSync(target);
+      fs.mkdirSync(target);
+      fs.writeFileSync(path.join(target, "child.txt"), "KEEP\n");
+      return downloadedObject({
+        contentLength: 3,
+        body: streamFrom([new TextEncoder().encode("NEW")]),
+      });
+    });
+
+    try {
+      const result = await tools.call("s3_get_object", {
+        bucket: "b",
+        key: "hello.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBe(true);
+      expectBadRequestToolError(result, /target .* cannot be written \((EISDIR|ENOTEMPTY)\)/);
+      expect(fs.readFileSync(path.join(target, "child.txt"), "utf8")).toBe("KEEP\n");
+      expect(fs.readdirSync(dir)).toEqual(["out.txt"]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  nonRootPosixIt("rejects a non-writable directory before fetching the object", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-ro-dir-"));
+    const target = path.join(dir, "writable.txt");
+    fs.writeFileSync(target, "KEEP\n");
+    fs.chmodSync(dir, 0o555);
+
+    try {
+      const result = await tools.call("s3_get_object", {
+        bucket: "b",
+        key: "hello.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBe(true);
+      expectBadRequestToolError(result, /directory .* cannot be written \(EACCES\)/);
+      expect(s3.requestsFor("getObject")).toHaveLength(0);
+      expect(fs.readFileSync(target, "utf8")).toBe("KEEP\n");
+    } finally {
+      fs.chmodSync(dir, 0o755);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  nonRootPosixIt("refuses to replace a read-only saveToPath target", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-ro-"));
+    const target = path.join(dir, "locked.txt");
+    fs.writeFileSync(target, "KEEP\n");
+    fs.chmodSync(target, 0o444);
+
+    try {
+      const result = await tools.call("s3_get_object", {
+        bucket: "b",
+        key: "hello.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBe(true);
+      expectBadRequestToolError(result, /not writable/i);
+      expect(s3.requestsFor("getObject")).toHaveLength(0);
+      expect(fs.readFileSync(target, "utf8")).toBe("KEEP\n");
+    } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
