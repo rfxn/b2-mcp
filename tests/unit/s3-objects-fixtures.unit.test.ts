@@ -952,6 +952,42 @@ describe("S3 object tools with deterministic handler fake", () => {
     }
   });
 
+  posixIt("reports a file root that vanishes mid-request as bad_request", async () => {
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-vanish-"));
+    const root = path.join(parent, "root");
+    fs.mkdirSync(root);
+    const sandboxed = new ToolHarness();
+    registerS3ObjectTools(sandboxed, s3.asPeerClient(), versionGuard, {
+      ...testConfig,
+      fileRoot: root,
+    });
+    // The root is renamed away right after the temp file opens, before its location is checked.
+    const realOpen = fs.promises.open.bind(fs.promises);
+    const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
+      const handle = await realOpen(...(args as Parameters<typeof realOpen>));
+      fs.renameSync(root, `${root}-gone`);
+      return handle;
+    });
+
+    try {
+      const result = await sandboxed.call("s3_get_object", {
+        bucket: "b",
+        key: "hello.txt",
+        saveToPath: path.join(root, "out.txt"),
+      });
+
+      expect(result.isError).toBe(true);
+      expectBadRequestToolError(
+        result,
+        /sandbox root does not exist|outside the allowed directory/i,
+      );
+      expect(s3.requestsFor("getObject")).toHaveLength(0);
+    } finally {
+      openSpy.mockRestore();
+      fs.rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
   it("reports a failed final rename as bad_request and keeps the destination", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-rename-"));
     const target = path.join(dir, "out.txt");

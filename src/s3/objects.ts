@@ -449,6 +449,8 @@ async function downloadToPath(
     // No reason: destroying an unconsumed Node body with an error would emit an
     // unhandled 'error' event when a failure lands before the pipeline attaches.
     if (body) await cancelBody(body);
+    // A sandbox root removed mid-request is a local path problem, as in the setup phase.
+    if (err instanceof FileAccessError) throw badRequestError(err.message);
     throw err;
   } finally {
     // Destroying the stream releases its hold on the handle; close() then waits
