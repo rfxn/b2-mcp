@@ -141,12 +141,9 @@ function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
 
 async function pipelineBodyToFileWithIdleTimeout(
   body: B2S3ObjectBody,
-  openWriteStream: () => fs.WriteStream,
+  writeStream: fs.WriteStream,
 ): Promise<number> {
   const source = nodeReadableFromBody(body);
-  // Opened only once the body is known to be readable, so a rejected body never
-  // strands a stream that holds the destination file open.
-  const writeStream = openWriteStream();
   const timeoutMs = saveToPathIdleTimeoutMs();
   let timer: ReturnType<typeof setTimeout> | undefined;
   let timeoutFailure: Error | null = null;
@@ -192,15 +189,11 @@ async function pipelineBodyToFileWithIdleTimeout(
   }
 }
 
-/** Local destination for an `s3_get_object` saveToPath download. */
 interface SaveToPathTarget {
-  /** Final path the completed download is renamed onto. */
   path: string;
-  /** Metadata of the regular file being replaced, or undefined for a new file. */
   existing: { mode: number; uid: number; gid: number; dev: number; ino: number } | undefined;
 }
 
-/** Errno codes that mean the caller named a local path this process cannot write. */
 const NOT_WRITABLE_CODES = new Set([
   "EACCES",
   "EPERM",
@@ -215,7 +208,6 @@ const NOT_WRITABLE_CODES = new Set([
   "EXDEV",
 ]);
 
-/** Map a local permission/shape failure to a correctable bad_request; rethrow the rest. */
 function notWritableError(err: unknown, what: string): unknown {
   const code = (err as NodeJS.ErrnoException | null)?.code;
   return code && NOT_WRITABLE_CODES.has(code)
@@ -223,19 +215,11 @@ function notWritableError(err: unknown, what: string): unknown {
     : err;
 }
 
-/**
- * Resolve and vet a saveToPath destination before any bytes are fetched. An
- * existing symlink is followed so the download replaces the file it points at,
- * not the link; a dangling link is replaced itself, never followed. Only
- * writable regular files may be replaced: a directory, device, FIFO, or socket
- * would be swapped out wholesale by the final rename.
- */
 async function prepareSaveToPathTarget(
   safePath: string,
   sandboxed: boolean,
 ): Promise<SaveToPathTarget> {
-  // A sandboxed path was already resolved (and root-checked) by resolveLocalPath;
-  // resolving it again could follow a link changed to point outside the root meanwhile.
+  // Already resolved under a sandbox; resolving again could follow a swapped link.
   const target = sandboxed ? safePath : await fs.promises.realpath(safePath).catch(() => safePath);
   let stat: fs.Stats;
   try {
@@ -251,14 +235,13 @@ async function prepareSaveToPathTarget(
       `saveToPath must name a regular file; '${target}' is ${stat.isDirectory() ? "a directory" : "not a regular file"}.`,
     );
   }
-  // The rename needs only directory write access; keep a read-only file protected
-  // exactly as the former in-place overwrite did.
+  // The rename needs only directory write access, so check the file itself.
   try {
     await fs.promises.access(target, fs.constants.W_OK);
   } catch {
     throw badRequestError(`saveToPath target '${target}' exists and is not writable.`);
   }
-  // Permission bits only: setuid/setgid/sticky are not carried onto new remote content.
+  // setuid, setgid and sticky are not carried onto downloaded content.
   return {
     path: target,
     existing: {
@@ -271,12 +254,6 @@ async function prepareSaveToPathTarget(
   };
 }
 
-/**
- * Best-effort owner/group carry-over for a replaced file, reporting what survived.
- * Root keeps both; any other user keeps the group when it is a member or when the
- * temp file already inherited it. The outcome is read back from the handle because
- * mounts that do not model ownership refuse the change without failing.
- */
 async function preserveOwnership(
   handle: fs.promises.FileHandle,
   existing: { uid: number; gid: number },
@@ -287,18 +264,12 @@ async function preserveOwnership(
   } catch {
     await handle.chown(-1, existing.gid).catch(() => undefined);
   }
+  // Read back: some mounts ignore chown without failing.
   const after = await handle.stat().catch(() => undefined);
   return { uid: after?.uid === existing.uid, gid: after?.gid === existing.gid };
 }
 
-/**
- * Permission bits that are safe to carry onto a replacement whose owner or group
- * could not be kept. A user matched by the replaced file's group or other bits can
- * fall into a different class on the new file, so only what every class it could
- * have matched already granted is carried; owner bits stay, since the new owner is
- * the process that just wrote the contents. Group and other end up equal, which is
- * the only way a class change cannot widen access.
- */
+// A lost owner or group can move a user into another class, so carry only shared bits.
 function modeCarriedSafely(mode: number, kept: { uid: boolean; gid: boolean }): number {
   if (kept.uid && kept.gid) return mode;
   const owner = (mode >> 6) & 0o7;
@@ -308,13 +279,7 @@ function modeCarriedSafely(mode: number, kept: { uid: boolean; gid: boolean }): 
   return (owner << 6) | (shared << 3) | shared;
 }
 
-/**
- * Path checks alone can be raced by swapping a symlinked ancestor between the
- * check and `open` (Node has no `openat`), so confirm where the opened temp file
- * really is. Linux reports the descriptor's path directly; elsewhere the real
- * path must hold the very same file (device and inode) as the handle. Either
- * way the result is compared to the root without resolving it again.
- */
+// Node has no openat, so confirm where the opened temp file actually is.
 async function assertOpenedInsideFileRoot(
   handle: fs.promises.FileHandle,
   tempPath: string,
@@ -326,8 +291,7 @@ async function assertOpenedInsideFileRoot(
   }
   if (openedPath === undefined) {
     const opened = await handle.stat();
-    // Same JS resolver fs-guard applies to the root: the native one can spell the same
-    // path differently (letter case on macOS, mapped or SUBST drives on Windows).
+    // fs-guard's resolver: the native one can spell paths differently (macOS case, SUBST).
     let realPath: string | undefined;
     try {
       realPath = fs.realpathSync(tempPath);
@@ -335,7 +299,7 @@ async function assertOpenedInsideFileRoot(
       realPath = undefined;
     }
     const onDisk = realPath ? await fs.promises.stat(realPath).catch(() => undefined) : undefined;
-    // A second link could be a name outside the root for the same file.
+    // A second link could name the same file outside the root.
     if (onDisk?.dev === opened.dev && onDisk.ino === opened.ino && opened.nlink === 1)
       openedPath = realPath;
   }
@@ -346,25 +310,19 @@ async function assertOpenedInsideFileRoot(
   }
 }
 
-/** A held parent directory, with the identity of the temp file it was confirmed to hold. */
 interface CommitAnchor {
   handle: fs.promises.FileHandle;
   dir: string;
 }
 
-/** A path that resolves `name` inside the pinned directory `dirFd`, ignoring its own path. */
 function atDirFd(dirFd: number, name: string): string {
   return `/proc/self/fd/${dirFd}/${name}`;
 }
 
-/** Flags for pinning a directory: read-only, and never a symlink to something else. */
+// O_DIRECTORY follows symlinks; the temp inode check is what confirms the pin.
 const PIN_DIR_FLAGS = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY;
 
-/**
- * Whether a pinned directory is inside the configured root *now*. The descriptor keeps
- * the directory identified after a move, so this has to be re-read rather than cached:
- * a pin taken inside the root can be moved out of it while the body is in flight.
- */
+// Re-read on every use: a pinned directory can be moved out of the root.
 async function pinnedDirInsideRoot(dirFd: number, sandbox?: B2Config): Promise<boolean> {
   if (!sandbox) return true;
   const realDir = await fs.promises.readlink(`/proc/self/fd/${dirFd}`).catch(() => undefined);
@@ -376,19 +334,7 @@ type ParentPin =
   | { kind: "unavailable" }
   | { kind: "refused"; message: string };
 
-/**
- * Pin the temp file's parent directory so the rename and the cleanup cannot be aimed
- * elsewhere: paths built with {@link atDirFd} resolve from the pinned inode, so an
- * ancestor swapped for a symlink during the download no longer redirects them. The
- * pin is trusted only once it is confirmed to hold the already-open temp file, and
- * to sit inside the root when one is configured; the temp file's identity is returned
- * so the commit can confirm the name still refers to it.
- *
- * `unavailable` leaves the path-based operations in place, and is only reported where
- * no pin exists to begin with: another platform, or a Linux host without `/proc` and
- * no sandbox to escape. Anything that could be provoked by another local user, or
- * that would silently weaken a sandboxed request, is `refused` instead.
- */
+// Holds the parent so a swapped ancestor cannot redirect the rename or cleanup (Linux).
 async function pinParentDir(
   dir: string,
   handle: fs.promises.FileHandle,
@@ -403,8 +349,7 @@ async function pinParentDir(
   if (
     (await fs.promises.readlink(`/proc/self/fd/${handle.fd}`).catch(() => undefined)) === undefined
   ) {
-    // Without /proc there is no way to hold the directory, so a sandboxed request has
-    // to fail rather than quietly fall back to the path-based operations.
+    // A sandboxed request fails rather than falling back to path-based operations.
     return sandbox
       ? refusal(
           `saveToPath cannot be completed safely under ${sandbox.fileRoot} on this host: /proc is unavailable.`,
@@ -439,7 +384,6 @@ async function pinParentDir(
   }
 }
 
-/** Longest prefix of `name` within `maxBytes` of UTF-8 that never splits a character. */
 function utf8Prefix(name: string, maxBytes: number): string {
   let prefix = "";
   let bytes = 0;
@@ -451,18 +395,13 @@ function utf8Prefix(name: string, maxBytes: number): string {
   return prefix;
 }
 
-/** A directory this download created, identified by inode so cleanup can confirm it. */
 interface CreatedDir {
   path: string;
   dev: number;
   ino: number;
 }
 
-/**
- * `mkdir -p` for `dir`, one level at a time, recording only the directories this call
- * itself created (EEXIST means another request made it), so cleanup never removes a
- * directory it does not own. Each level's inode is recorded with it.
- */
+// mkdir -p that records only the levels this call created, so cleanup never takes others.
 async function makeParentDirs(dir: string, createdDirs: CreatedDir[]): Promise<void> {
   const missing: string[] = [];
   for (let current = dir; path.dirname(current) !== current; current = path.dirname(current)) {
@@ -486,13 +425,6 @@ async function makeParentDirs(dir: string, createdDirs: CreatedDir[]): Promise<v
   }
 }
 
-/**
- * Remove the directories this download created, deepest first; a non-empty one stays.
- * With a pin on the deepest level, each level is removed through its parent's pinned
- * descriptor, reached by walking `..`, so a swapped ancestor cannot aim the rmdir at a
- * directory outside the sandbox. Without one, a level is removed only while it is
- * still the very inode that was created.
- */
 async function removeCreatedDirs(
   createdDirs: readonly CreatedDir[],
   anchor?: CommitAnchor,
@@ -514,34 +446,24 @@ async function removeCreatedDirs(
   try {
     let child = anchor.handle;
     for (const created of deepestFirst) {
-      // `..` follows the directory wherever it is now, so a level moved under a parent
-      // of the caller's choosing must not carry the walk out of the root with it.
+      // `..` follows a moved directory, so each parent is checked against the root.
       const parent = await fs.promises.open(atDirFd(child.fd, ".."), PIN_DIR_FLAGS);
       parents.push(parent);
       if (!(await pinnedDirInsideRoot(parent.fd, sandbox))) return;
       const name = atDirFd(parent.fd, path.basename(created.path));
-      // The name may hold something else by now, including a decoy left in its place.
       const onDisk = await fs.promises.lstat(name).catch(() => undefined);
       if (onDisk?.dev !== created.dev || onDisk.ino !== created.ino) return;
       await fs.promises.rmdir(name).catch(() => undefined);
       child = parent;
     }
   } catch {
-    // A level that cannot be reopened stops the walk; what is left behind is empty.
+    // A level that cannot be reopened stops the walk; what remains is empty.
   } finally {
     for (const parent of parents) await parent.close().catch(() => undefined);
   }
 }
 
-/**
- * Refuse a commit whose ground has shifted while the body was in flight: the temp name
- * must still be the file this download wrote, since the entry can be replaced by anyone
- * who may write the directory, and a destination that has been given new permissions or a new owner
- * must not be replaced under the permissions captured before the fetch. Both are checked
- * as late as possible; an atomic commit would need an fd-relative exchange Node has no
- * binding for, so a caller who wins the remaining window gets a refusal, not a silent
- * substitution.
- */
+// Node has no renameat2, so a change between these checks and the rename goes undetected.
 async function assertCommitStillMatchesVetting(
   target: SaveToPathTarget,
   anchor: CommitAnchor | undefined,
@@ -551,7 +473,6 @@ async function assertCommitStillMatchesVetting(
 ): Promise<void> {
   const dir = path.dirname(tempPath);
   const at = (name: string) => (anchor ? atDirFd(anchor.handle.fd, name) : path.join(dir, name));
-  // Checked with or without a pin: the entry can be swapped on any platform.
   const temp = await fs.promises.lstat(at(tempName)).catch(() => undefined);
   if (temp?.dev !== tempId.dev || temp.ino !== tempId.ino) {
     throw badRequestError(
@@ -574,41 +495,22 @@ async function assertCommitStillMatchesVetting(
   }
 }
 
-/**
- * Download an object into `target` through an exclusively created sibling temp
- * file that is renamed into place only after the full, length-verified body is
- * synced to disk and closed. The temp file (and any missing parent directory)
- * is created before the object is requested, so local setup problems fail
- * before any bytes are fetched and never count against the S3 transfer circuit.
- * Every exit path closes the handle, removes the temp file and any directories
- * it created, and cancels an unconsumed body, so a failed or interrupted
- * transfer leaves the filesystem as it was.
- *
- * @returns The number of bytes saved.
- */
 async function downloadToPath(
   target: SaveToPathTarget,
   fetchObject: () => Promise<B2S3DownloadedObject>,
   sandbox?: B2Config,
 ): Promise<number> {
   const dir = path.dirname(target.path);
-  // At most 64 UTF-8 bytes of the name plus the 24-byte suffix keeps the temp
-  // name far below the common 255-byte NAME_MAX for any target name.
+  // 64 bytes of the name plus a 24-byte suffix stays under a 255-byte NAME_MAX.
   const tempName = `${utf8Prefix(path.basename(target.path), 64)}.b2mcp-${randomBytes(6).toString("hex")}.part`;
   const tempPath = path.join(dir, tempName);
   const createdDirs: CreatedDir[] = [];
   let handle: fs.promises.FileHandle;
   try {
     await makeParentDirs(dir, createdDirs);
-    // Re-apply the sandbox check to the now-existing directory: a symlinked
-    // ancestor that was dangling when the path was vetted may have been given a
-    // target outside the root since, and mkdir would then have followed it. The
-    // opened file's actual location is verified again once it is open.
+    // mkdir follows an ancestor link that was dangling at vetting and may now point out.
     if (sandbox) resolveLocalPath(sandbox, dir, "write");
-    // "wx" is O_CREAT|O_EXCL: never follows or reuses an existing path. Created with
-    // only the replaced file's owner bits, so neither an interrupted run nor a refused
-    // chmod can leave the contents more readable than what they replace; the final
-    // mode is set below.
+    // Owner bits only until the chmod below, so a refused chmod cannot widen access.
     handle = await fs.promises.open(
       tempPath,
       "wx",
@@ -624,8 +526,7 @@ async function downloadToPath(
   let writeStream: fs.WriteStream | undefined;
   let committed = false;
   let anchor: CommitAnchor | undefined;
-  // Set once the opened file and its directory are confirmed to be the ones that were
-  // vetted; until then a swapped ancestor could aim the directory cleanup elsewhere.
+  // Until the opened file and its directory are confirmed, a swap could aim cleanup elsewhere.
   let cleanupIsSafe = false;
   let tempId: { dev: number; ino: number } | undefined;
   try {
@@ -636,26 +537,20 @@ async function downloadToPath(
     if (pin.kind === "pinned") anchor = { handle: pin.handle, dir };
     if (pin.kind === "refused") throw badRequestError(pin.message);
     cleanupIsSafe = true;
-    // Owner and mode are set before any byte lands, so the contents are never
-    // exposed under looser metadata than the file they replace.
     if (target.existing) {
       const kept = await preserveOwnership(handle, target.existing);
-      // Best effort, like ownership: FAT and SMB mounts may refuse fchmod, and the
-      // temp file was created with only the owner bits, never wider than this mode.
+      // Best effort: FAT and SMB mounts may refuse fchmod.
       await handle.chmod(modeCarriedSafely(target.existing.mode, kept)).catch(() => undefined);
     }
     const object = await fetchObject();
     body = object.body;
     const bytes = await withS3LongCircuit(async () => {
+      // The stream owns the handle from here; flush fsyncs before it closes.
+      const stream = handle.createWriteStream({ flush: true });
+      writeStream = stream;
       const written = await withBodyReadAbort(object.body, () =>
-        pipelineBodyToFileWithIdleTimeout(object.body, () => {
-          // The stream takes ownership of the handle: flush syncs it to disk and the
-          // stream closes it once the pipeline finishes or is destroyed.
-          writeStream = handle.createWriteStream({ flush: true });
-          return writeStream;
-        }),
+        pipelineBodyToFileWithIdleTimeout(object.body, stream),
       );
-      // A body that ends cleanly but short must never replace a good file.
       if (Number.isFinite(object.contentLength) && written !== object.contentLength) {
         throw codedError(
           502,
@@ -665,8 +560,6 @@ async function downloadToPath(
       }
       return written;
     });
-    // The pin fixes which directory the rename lands in, but not where that directory
-    // has since been moved to, so its location is re-read against the root here.
     if (anchor && !(await pinnedDirInsideRoot(anchor.handle.fd, sandbox))) {
       throw badRequestError(
         `Path is outside the allowed directory (${sandbox?.fileRoot}); the saveToPath directory was moved while the download was in flight.`,
@@ -687,15 +580,12 @@ async function downloadToPath(
     committed = true;
     return bytes;
   } catch (err) {
-    // No reason: destroying an unconsumed Node body with an error would emit an
-    // unhandled 'error' event when a failure lands before the pipeline attaches.
+    // No reason: an error would surface as an unhandled 'error' on an unconsumed Node body.
     if (body) await cancelBody(body);
-    // A sandbox root removed mid-request is a local path problem, as in the setup phase.
     if (err instanceof FileAccessError) throw badRequestError(err.message);
     throw err;
   } finally {
-    // Destroying the stream releases its hold on the handle; close() then waits
-    // for in-flight writes and is a no-op if the stream already closed it.
+    // destroy() releases the handle; close() is then a no-op if the stream closed it.
     writeStream?.destroy();
     await handle.close().catch(() => undefined);
     if (!committed) {
@@ -704,8 +594,6 @@ async function downloadToPath(
       if (entry && entry.dev === tempId?.dev && entry.ino === tempId.ino) {
         await fs.promises.unlink(temp).catch(() => undefined);
       }
-      // Directory names are predictable, so they are only removed once the directory
-      // this download wrote to has been confirmed.
       if (cleanupIsSafe) await removeCreatedDirs(createdDirs, anchor, sandbox);
     }
     await anchor?.handle.close().catch(() => undefined);
@@ -1109,8 +997,7 @@ export function registerS3ObjectTools(
     },
     async (args) => {
       try {
-        // Vet the local destination before any network call, so a rejected path
-        // never leaves an open object body behind.
+        // Vetted before any request, so a rejected path never leaves an open body behind.
         const saveTarget = args.saveToPath
           ? await prepareSaveToPathTarget(
               resolveLocalPath(config, args.saveToPath, "write"),

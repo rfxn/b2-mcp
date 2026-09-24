@@ -31,10 +31,8 @@ function isInside(root: string, target: string): boolean {
 }
 
 /**
- * Report whether an already fully resolved absolute path lies inside the
- * configured sandbox root, without resolving the path again. Use it for a path
- * the kernel reported for an open file descriptor, where a second resolution
- * could be raced by swapping a symlinked ancestor.
+ * Report whether an already resolved path is inside the sandbox root without
+ * resolving it again, as for a path the kernel reported for an open descriptor.
  *
  * @param config - Server configuration carrying the optional sandbox root.
  * @param realPath - Absolute path with every symlink already resolved.
