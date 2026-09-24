@@ -532,18 +532,18 @@ async function removeCreatedDirs(
 async function assertCommitStillMatchesVetting(
   target: SaveToPathTarget,
   anchor: CommitAnchor | undefined,
+  tempId: { dev: number; ino: number },
   tempName: string,
   tempPath: string,
 ): Promise<void> {
   const dir = path.dirname(tempPath);
   const at = (name: string) => (anchor ? atDirFd(anchor.handle.fd, name) : path.join(dir, name));
-  if (anchor) {
-    const temp = await fs.promises.lstat(at(tempName)).catch(() => undefined);
-    if (temp?.dev !== anchor.temp.dev || temp.ino !== anchor.temp.ino) {
-      throw badRequestError(
-        `The saveToPath temp file was replaced while the download was in flight; '${target.path}' was left unchanged.`,
-      );
-    }
+  // Checked with or without a pin: the entry can be swapped on any platform.
+  const temp = await fs.promises.lstat(at(tempName)).catch(() => undefined);
+  if (temp?.dev !== tempId.dev || temp.ino !== tempId.ino) {
+    throw badRequestError(
+      `The saveToPath temp file was replaced while the download was in flight; '${target.path}' was left unchanged.`,
+    );
   }
   if (!target.existing) return;
   const now = await fs.promises.stat(at(path.basename(target.path))).catch(() => undefined);
@@ -593,11 +593,19 @@ async function downloadToPath(
     // opened file's actual location is verified again once it is open.
     if (sandbox) resolveLocalPath(sandbox, dir, "write");
     // "wx" is O_CREAT|O_EXCL: never follows or reuses an existing path. Created with
-    // the replaced file's bits so an interrupted run cannot leave the contents more
-    // readable than what they replace; the final mode is set below.
-    handle = await fs.promises.open(tempPath, "wx", target.existing?.mode ?? 0o666);
+    // only the replaced file's owner bits, so neither an interrupted run nor a refused
+    // chmod can leave the contents more readable than what they replace; the final
+    // mode is set below.
+    handle = await fs.promises.open(
+      tempPath,
+      "wx",
+      target.existing ? target.existing.mode & 0o700 : 0o666,
+    );
   } catch (err) {
-    await removeCreatedDirs(createdDirs);
+    // Under a sandbox the recorded inodes come from a path lookup that a swapped
+    // ancestor can have aimed outside the root, and nothing is pinned yet, so the
+    // directories are left in place rather than removed by path.
+    if (!sandbox) await removeCreatedDirs(createdDirs);
     if (err instanceof FileAccessError) throw badRequestError(err.message);
     throw notWritableError(err, `directory '${dir}'`);
   }
@@ -611,6 +619,8 @@ async function downloadToPath(
   let cleanupIsSafe = false;
   try {
     if (sandbox) await assertOpenedInsideFileRoot(handle, tempPath, sandbox);
+    const opened = await handle.stat();
+    const tempId = { dev: opened.dev, ino: opened.ino };
     const pin = await pinParentDir(dir, handle, tempName, sandbox);
     if (pin.kind === "pinned") anchor = { handle: pin.handle, dir, temp: pin.temp };
     if (pin.kind === "refused") throw badRequestError(pin.message);
@@ -619,8 +629,8 @@ async function downloadToPath(
     // exposed under looser metadata than the file they replace.
     if (target.existing) {
       const kept = await preserveOwnership(handle, target.existing);
-      // Best effort, like ownership: FAT and SMB mounts may refuse
-      // fchmod, and the temp file was already created no wider than this mode.
+      // Best effort, like ownership: FAT and SMB mounts may refuse fchmod, and the
+      // temp file was created with only the owner bits, never wider than this mode.
       await handle.chmod(modeCarriedSafely(target.existing.mode, kept)).catch(() => undefined);
     }
     const object = await fetchObject();
@@ -651,7 +661,7 @@ async function downloadToPath(
         `Path is outside the allowed directory (${sandbox?.fileRoot}); the saveToPath directory was moved while the download was in flight.`,
       );
     }
-    await assertCommitStillMatchesVetting(target, anchor, tempName, tempPath);
+    await assertCommitStillMatchesVetting(target, anchor, tempId, tempName, tempPath);
     try {
       await (anchor
         ? fs.promises.rename(

@@ -1126,9 +1126,12 @@ describe("S3 object tools with deterministic handler fake", () => {
       expect(result.isError).toBe(true);
       expectBadRequestToolError(result, /outside the allowed directory/i);
       expect(s3.requestsFor("getObject")).toHaveLength(0);
-      // Refused by the post-mkdir check, before any temp file is created.
+      // Refused by the post-mkdir check, before any temp file is created. The escaped
+      // level is left empty rather than removed by path: from here it cannot be told
+      // apart from a directory someone else owns.
       expect(opened.handles).toHaveLength(0);
-      expect(fs.readdirSync(escapeDir)).toEqual([]);
+      expect(fs.readdirSync(escapeDir)).toEqual(["sub"]);
+      expect(fs.readdirSync(path.join(escapeDir, "sub"))).toEqual([]);
     } finally {
       opened.restore();
       fs.rmSync(root, { recursive: true, force: true });
@@ -1531,6 +1534,134 @@ describe("S3 object tools with deterministic handler fake", () => {
       expect(fs.readFileSync(target, "utf8")).toBe("KEEP\n");
     } finally {
       opened.restore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // The inode recorded for a created directory comes from a path lookup, so an ancestor
+  // swapped right after mkdir records a directory outside the root. When the sandbox
+  // re-check then fails the setup, nothing is pinned yet and nothing may be removed.
+  posixIt("keeps an outside directory when the setup fails its sandbox re-check", async () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-setup-root-")));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-setup-out-"));
+    fs.mkdirSync(path.join(outside, "x"));
+    // Dangling while the path is vetted; given an inside target just before mkdir,
+    // then swapped out of the root before the created directory's inode is recorded.
+    const link = path.join(root, "link");
+    fs.symlinkSync(path.join(root, "later"), link);
+    const target = path.join(link, "x", "out.txt");
+    const sandboxed = new ToolHarness();
+    registerS3ObjectTools(sandboxed, s3.asPeerClient(), versionGuard, {
+      ...testConfig,
+      fileRoot: root,
+    });
+    const realMkdir = fs.promises.mkdir.bind(fs.promises);
+    const mkdirSpy = vi.spyOn(fs.promises, "mkdir").mockImplementation(async (...args) => {
+      const swap = String(args[0]).endsWith(path.join("link", "x"));
+      if (swap) fs.mkdirSync(path.join(root, "later"));
+      const made = await realMkdir(...(args as Parameters<typeof realMkdir>));
+      if (swap) {
+        fs.unlinkSync(link);
+        fs.symlinkSync(outside, link);
+      }
+      return made;
+    });
+    queueWebBody("NEW");
+
+    try {
+      const result = await sandboxed.call("s3_get_object", {
+        bucket: "b",
+        key: "hello.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBe(true);
+      expectBadRequestToolError(result, /outside the allowed directory/i);
+      expect(fs.existsSync(path.join(outside, "x"))).toBe(true);
+    } finally {
+      mkdirSpy.mockRestore();
+      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  // Without a pin the commit is path-based, but the temp entry's identity is still
+  // known from the open handle, so a swapped entry is refused on every platform.
+  posixIt("refuses a replaced temp entry without a pin", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-nopin-entry-"));
+    const target = path.join(dir, "out.txt");
+    fs.writeFileSync(target, "KEEP\n");
+    const realPlatform = process.platform;
+    Object.defineProperty(process, "platform", { value: "darwin" });
+    const opened = trackOpenedHandles();
+    s3.respond("getObject", () => {
+      const temp = opened.paths.find((name) => name.endsWith(".part"));
+      if (temp) {
+        fs.rmSync(temp);
+        fs.writeFileSync(temp, "ACTOR\n");
+      }
+      return downloadedObject({
+        contentLength: 3,
+        body: streamFrom([new TextEncoder().encode("NEW")]),
+      });
+    });
+
+    try {
+      const result = await tools.call("s3_get_object", {
+        bucket: "b",
+        key: "hello.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBe(true);
+      expectBadRequestToolError(result, /temp file was replaced while the download was in flight/i);
+      expect(fs.readFileSync(target, "utf8")).toBe("KEEP\n");
+    } finally {
+      Object.defineProperty(process, "platform", { value: realPlatform });
+      opened.restore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // A refused fchmod must not leave the replacement readable by a class the original
+  // denied: the temp file starts with the owner bits only.
+  posixIt("keeps group and other bits clear when chmod is refused", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-nochmod-"));
+    const target = path.join(dir, "owned.txt");
+    fs.writeFileSync(target, "OLD\n");
+    fs.chmodSync(target, 0o640);
+    const realOpen = fs.promises.open.bind(fs.promises);
+    const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
+      const handle = await realOpen(...(args as Parameters<typeof realOpen>));
+      if (!String(args[0]).endsWith(".part")) return handle;
+      handle.chown = async () => {
+        throw Object.assign(new Error("EPERM"), { code: "EPERM" });
+      };
+      handle.chmod = async () => {
+        throw Object.assign(new Error("EPERM"), { code: "EPERM" });
+      };
+      const realStat = handle.stat.bind(handle);
+      handle.stat = (async () => {
+        const stat = await realStat();
+        Object.defineProperty(stat, "gid", { value: stat.gid + 1 });
+        return stat;
+      }) as typeof handle.stat;
+      return handle;
+    });
+    queueWebBody("NEW");
+
+    try {
+      const result = await tools.call("s3_get_object", {
+        bucket: "b",
+        key: "hello.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(fs.statSync(target).mode & 0o077).toBe(0);
+      expect(fs.readFileSync(target, "utf8")).toBe("NEW");
+    } finally {
+      openSpy.mockRestore();
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
