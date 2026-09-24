@@ -902,6 +902,62 @@ describe("S3 object tools with deterministic handler fake", () => {
     }
   });
 
+  // A user matched by the replaced file's group or other bits can land in a different
+  // class on the replacement, so a carried bit that looks narrower can still widen
+  // access. Ownership cannot fail under the test user, so the refusal is simulated.
+  posixIt("carries only class-intersection bits when ownership cannot be preserved", async () => {
+    const cases = [
+      // Group read would pass to the process's own group.
+      { mode: 0o640, keepUid: true, expected: 0o600 },
+      // Group members were denied by their class; as "other" they would gain read.
+      { mode: 0o604, keepUid: true, expected: 0o600 },
+      // Everyone already had read, so carrying it widens nothing.
+      { mode: 0o646, keepUid: true, expected: 0o644 },
+      // The replaced owner is a third party once the uid changes too, so its bits join
+      // the intersection: the write-only owner then holds the result down to `0222`.
+      { mode: 0o266, keepUid: false, expected: 0o222 },
+    ];
+
+    for (const { mode, keepUid, expected } of cases) {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-clamp-"));
+      const target = path.join(dir, "owned.txt");
+      fs.writeFileSync(target, "OLD\n");
+      fs.chmodSync(target, mode);
+      const realOpen = fs.promises.open.bind(fs.promises);
+      const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
+        const handle = await realOpen(...(args as Parameters<typeof realOpen>));
+        if (!String(args[0]).endsWith(".part")) return handle;
+        handle.chown = async () => {
+          throw Object.assign(new Error("EPERM"), { code: "EPERM" });
+        };
+        const realStat = handle.stat.bind(handle);
+        handle.stat = (async () => {
+          const stat = await realStat();
+          Object.defineProperty(stat, "gid", { value: stat.gid + 1 });
+          if (!keepUid) Object.defineProperty(stat, "uid", { value: stat.uid + 1 });
+          return stat;
+        }) as typeof handle.stat;
+        return handle;
+      });
+      queueWebBody("NEW");
+
+      try {
+        const result = await tools.call("s3_get_object", {
+          bucket: "b",
+          key: "hello.txt",
+          saveToPath: target,
+        });
+
+        expect(result.isError).toBeFalsy();
+        expect(fs.statSync(target).mode & 0o777).toBe(expected);
+        if (expected & 0o400) expect(fs.readFileSync(target, "utf8")).toBe("NEW");
+      } finally {
+        openSpy.mockRestore();
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
   posixIt("replaces a dangling symlink inside the file root instead of following it", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-root-"));
     const outside = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-outside-"));

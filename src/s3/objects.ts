@@ -263,20 +263,40 @@ async function prepareSaveToPathTarget(
 }
 
 /**
- * Best-effort owner/group carry-over for a replaced file. Root keeps both; any
- * other user keeps the group when it is a member. Refusals are expected and
- * leave the process defaults, which is what a brand-new file would get.
+ * Best-effort owner/group carry-over for a replaced file, reporting what survived.
+ * Root keeps both; any other user keeps the group when it is a member or when the
+ * temp file already inherited it. The outcome is read back from the handle because
+ * mounts that do not model ownership refuse the change without failing.
  */
 async function preserveOwnership(
   handle: fs.promises.FileHandle,
   existing: { uid: number; gid: number },
-): Promise<void> {
-  if (process.platform === "win32") return;
+): Promise<{ uid: boolean; gid: boolean }> {
+  if (process.platform === "win32") return { uid: true, gid: true };
   try {
     await handle.chown(existing.uid, existing.gid);
   } catch {
     await handle.chown(-1, existing.gid).catch(() => undefined);
   }
+  const after = await handle.stat().catch(() => undefined);
+  return { uid: after?.uid === existing.uid, gid: after?.gid === existing.gid };
+}
+
+/**
+ * Permission bits that are safe to carry onto a replacement whose owner or group
+ * could not be kept. A user matched by the replaced file's group or other bits can
+ * fall into a different class on the new file, so only what every class it could
+ * have matched already granted is carried; owner bits stay, since the new owner is
+ * the process that just wrote the contents. Group and other end up equal, which is
+ * the only way a class change cannot widen access.
+ */
+function modeCarriedSafely(mode: number, kept: { uid: boolean; gid: boolean }): number {
+  if (kept.uid && kept.gid) return mode;
+  const owner = (mode >> 6) & 0o7;
+  const group = (mode >> 3) & 0o7;
+  const other = mode & 0o7;
+  const shared = kept.uid ? group & other : owner & group & other;
+  return (owner << 6) | (shared << 3) | shared;
 }
 
 /**
@@ -393,9 +413,9 @@ async function downloadToPath(
     // target outside the root since, and mkdir would then have followed it. The
     // opened file's actual location is verified again once it is open.
     if (sandbox) resolveLocalPath(sandbox, dir, "write");
-    // "wx" is O_CREAT|O_EXCL: never follows or reuses an existing path. Creating
-    // with the replaced file's bits (umask only narrows them) keeps private
-    // contents from ever being more readable than the file they replace.
+    // "wx" is O_CREAT|O_EXCL: never follows or reuses an existing path. Created with
+    // the replaced file's bits so an interrupted run cannot leave the contents more
+    // readable than what they replace; the final mode is set below.
     handle = await fs.promises.open(tempPath, "wx", target.existing?.mode ?? 0o666);
   } catch (err) {
     await removeCreatedDirs(createdDirs);
@@ -411,10 +431,10 @@ async function downloadToPath(
     // Owner and mode are set before any byte lands, so the contents are never
     // exposed under looser metadata than the file they replace.
     if (target.existing) {
-      await preserveOwnership(handle, target.existing);
+      const kept = await preserveOwnership(handle, target.existing);
       // Best effort, like ownership: FAT and SMB mounts may refuse
       // fchmod, and the temp file was already created no wider than this mode.
-      await handle.chmod(target.existing.mode).catch(() => undefined);
+      await handle.chmod(modeCarriedSafely(target.existing.mode, kept)).catch(() => undefined);
     }
     const object = await fetchObject();
     body = object.body;
