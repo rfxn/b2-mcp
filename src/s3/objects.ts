@@ -479,8 +479,10 @@ async function assertCommitStillMatchesVetting(
       `The saveToPath temp file was replaced while the download was in flight; '${target.path}' was left unchanged.`,
     );
   }
-  const now = await fs.promises.stat(at(path.basename(target.path))).catch(() => undefined);
   const was = target.existing;
+  const name = at(path.basename(target.path));
+  // lstat catches a link swapped in for a vetted file; stat keeps a dangling link absent.
+  const now = await (was ? fs.promises.lstat(name) : fs.promises.stat(name)).catch(() => undefined);
   const unchanged = was
     ? now?.dev === was.dev &&
       now.ino === was.ino &&
@@ -545,8 +547,8 @@ async function downloadToPath(
     const object = await fetchObject();
     body = object.body;
     const bytes = await withS3LongCircuit(async () => {
-      // The stream owns the handle from here; flush fsyncs before it closes.
-      const stream = handle.createWriteStream({ flush: true });
+      // Held open through the commit, so the temp inode is not evicted or its number reused.
+      const stream = handle.createWriteStream({ autoClose: false });
       writeStream = stream;
       const written = await withBodyReadAbort(object.body, () =>
         pipelineBodyToFileWithIdleTimeout(object.body, stream),
@@ -560,6 +562,7 @@ async function downloadToPath(
       }
       return written;
     });
+    await handle.sync();
     if (anchor && !(await pinnedDirInsideRoot(anchor.handle.fd, sandbox))) {
       throw badRequestError(
         `Path is outside the allowed directory (${sandbox?.fileRoot}); the saveToPath directory was moved while the download was in flight.`,
@@ -585,7 +588,6 @@ async function downloadToPath(
     if (err instanceof FileAccessError) throw badRequestError(err.message);
     throw err;
   } finally {
-    // destroy() releases the handle; close() is then a no-op if the stream closed it.
     writeStream?.destroy();
     await handle.close().catch(() => undefined);
     if (!committed) {

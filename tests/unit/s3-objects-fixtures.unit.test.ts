@@ -780,15 +780,18 @@ describe("S3 object tools with deterministic handler fake", () => {
     fs.writeFileSync(target, "OLD\n");
     const { ino, uid, gid } = fs.statSync(target);
     const vetted = { uid: uid + 1, gid: gid + 1 };
-    const realStat = fs.promises.stat.bind(fs.promises);
-    const statSpy = vi.spyOn(fs.promises, "stat").mockImplementation(async (...args) => {
-      const stat = await realStat(...(args as Parameters<typeof realStat>));
-      if (stat.ino === ino) {
-        Object.defineProperty(stat, "uid", { value: vetted.uid });
-        Object.defineProperty(stat, "gid", { value: vetted.gid });
-      }
-      return stat;
-    });
+    const fakeOwner = (method: "stat" | "lstat") => {
+      const real = fs.promises[method].bind(fs.promises) as typeof fs.promises.stat;
+      return vi.spyOn(fs.promises, method as "stat").mockImplementation(async (...args) => {
+        const stat = await real(...(args as Parameters<typeof real>));
+        if (stat.ino === ino) {
+          Object.defineProperty(stat, "uid", { value: vetted.uid });
+          Object.defineProperty(stat, "gid", { value: vetted.gid });
+        }
+        return stat;
+      });
+    };
+    const statSpies = [fakeOwner("stat"), fakeOwner("lstat")];
     const chownCalls: Array<[number, number]> = [];
     const realOpen = fs.promises.open.bind(fs.promises);
     const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
@@ -812,7 +815,7 @@ describe("S3 object tools with deterministic handler fake", () => {
       ]);
       expect(fs.readFileSync(target, "utf8")).toBe("NEW");
     } finally {
-      statSpy.mockRestore();
+      for (const spy of statSpies) spy.mockRestore();
       openSpy.mockRestore();
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -1306,6 +1309,33 @@ describe("S3 object tools with deterministic handler fake", () => {
     );
   }
 
+  it("keeps the temp file open until it is renamed into place", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-held-"));
+    const target = path.join(dir, "out.txt");
+    fs.writeFileSync(target, "OLD\n");
+    const opened = trackOpenedHandles();
+    const realRename = fs.promises.rename.bind(fs.promises);
+    let heldAtRename: boolean | undefined;
+    const renameSpy = vi.spyOn(fs.promises, "rename").mockImplementation(async (from, to) => {
+      const temp = opened.handles[opened.paths.findIndex((name) => name.endsWith(".part"))];
+      heldAtRename = temp !== undefined && temp.fd !== -1;
+      return realRename(from, to);
+    });
+    queueWebBody("NEW");
+
+    try {
+      const result = await saveTo(target);
+
+      expect(result.isError).toBeFalsy();
+      expect(heldAtRename).toBe(true);
+      expect(opened.handles.every((handle) => handle.fd === -1)).toBe(true);
+    } finally {
+      renameSpy.mockRestore();
+      opened.restore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   const destinationChanges = [
     {
       name: "had its permissions tightened",
@@ -1320,6 +1350,14 @@ describe("S3 object tools with deterministic handler fake", () => {
         fs.renameSync(`${target}.new`, target);
       },
       left: "OTHER\n",
+    },
+    {
+      name: "was swapped for a symlink to itself",
+      change: (target: string) => {
+        fs.renameSync(target, `${target}.orig`);
+        fs.symlinkSync(`${target}.orig`, target);
+      },
+      left: "KEEP\n",
     },
     {
       name: "was created while absent",
