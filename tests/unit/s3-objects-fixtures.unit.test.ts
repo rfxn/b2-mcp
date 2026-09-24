@@ -1734,10 +1734,14 @@ describe("S3 object tools with deterministic handler fake", () => {
     }
   });
 
-  linuxIt("keeps the directories it created when the parent cannot be pinned", async () => {
-    const base = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-none-dir-"));
-    const dir = path.join(base, "a", "b");
-    const target = path.join(dir, "out.txt");
+  linuxIt("refuses a sandboxed save whose parent cannot be pinned", async () => {
+    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-none-")));
+    const dir = path.join(root, "a", "b");
+    const sandboxed = new ToolHarness();
+    registerS3ObjectTools(sandboxed, s3.asPeerClient(), versionGuard, {
+      ...testConfig,
+      fileRoot: root,
+    });
     const realOpen = fs.promises.open.bind(fs.promises);
     const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
       if (String(args[0]) === dir) throw Object.assign(new Error("EACCES"), { code: "EACCES" });
@@ -1746,48 +1750,20 @@ describe("S3 object tools with deterministic handler fake", () => {
     queueWebBody("NEW");
 
     try {
-      const result = await tools.call("s3_get_object", {
+      const result = await sandboxed.call("s3_get_object", {
         bucket: "b",
         key: "hello.txt",
-        saveToPath: target,
-      });
-
-      expect(result.isError).toBe(true);
-      // Left in place: the directory they were created in is no longer confirmed.
-      expect(fs.readdirSync(dir)).toEqual([]);
-    } finally {
-      openSpy.mockRestore();
-      fs.rmSync(base, { recursive: true, force: true });
-    }
-  });
-
-  linuxIt("refuses the save when the parent directory cannot be pinned", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-none-"));
-    const target = path.join(dir, "out.txt");
-    fs.writeFileSync(target, "KEEP\n");
-    const realOpen = fs.promises.open.bind(fs.promises);
-    // A directory the caller can write but not open is enough to lose the pin, so the
-    // save must fail rather than fall back to the path-based operations.
-    const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
-      if (String(args[0]) === dir) throw Object.assign(new Error("EACCES"), { code: "EACCES" });
-      return realOpen(...(args as Parameters<typeof realOpen>));
-    });
-    queueWebBody("NEW");
-
-    try {
-      const result = await tools.call("s3_get_object", {
-        bucket: "b",
-        key: "hello.txt",
-        saveToPath: target,
+        saveToPath: path.join(dir, "out.txt"),
       });
 
       expect(result.isError).toBe(true);
       expectBadRequestToolError(result, /changed while the download was being prepared/i);
-      expect(fs.readFileSync(target, "utf8")).toBe("KEEP\n");
-      expect(fs.readdirSync(dir)).toEqual(["out.txt"]);
+      expect(s3.requestsFor("getObject")).toHaveLength(0);
+      // Left in place: the directory they were created in was never confirmed.
+      expect(fs.readdirSync(dir)).toEqual([]);
     } finally {
       openSpy.mockRestore();
-      fs.rmSync(dir, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
@@ -1948,6 +1924,27 @@ describe("S3 object tools with deterministic handler fake", () => {
       expect(s3.requestsFor("getObject")).toHaveLength(0);
       expect(fs.readFileSync(target, "utf8")).toBe("KEEP\n");
     } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  nonRootPosixIt("saves into a writable directory it cannot list without a file root", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-dropbox-"));
+    const target = path.join(dir, "out.txt");
+    fs.chmodSync(dir, 0o333);
+    queueWebBody("NEW");
+
+    try {
+      const result = await tools.call("s3_get_object", {
+        bucket: "b",
+        key: "hello.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(fs.readFileSync(target, "utf8")).toBe("NEW");
+    } finally {
+      fs.chmodSync(dir, 0o755);
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });

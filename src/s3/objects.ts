@@ -405,7 +405,8 @@ async function pinParentDir(
   try {
     dirHandle = await fs.promises.open(dir, PIN_DIR_FLAGS);
   } catch {
-    return changed;
+    // e.g. a writable directory the process cannot list (a 0333 drop box).
+    return sandbox ? changed : { kind: "unavailable" };
   }
   const refuse = async (result: ParentPin): Promise<ParentPin> => {
     await dirHandle.close().catch(() => undefined);
