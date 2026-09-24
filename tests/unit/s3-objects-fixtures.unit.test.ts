@@ -612,27 +612,6 @@ describe("S3 object tools with deterministic handler fake", () => {
     },
   );
 
-  it("saves to targets whose names are too long for a suffixed temp name", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-long-"));
-    const name = `${"x".repeat(240)}.txt`;
-    const target = path.join(dir, name);
-    queueWebBody("NEW");
-
-    try {
-      const result = await tools.call("s3_get_object", {
-        bucket: "b",
-        key: "hello.txt",
-        saveToPath: target,
-      });
-
-      expect(result.isError).toBeFalsy();
-      expect(fs.readFileSync(target, "utf8")).toBe("NEW");
-      expect(fs.readdirSync(dir)).toEqual([name]);
-    } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
   it("rejects a directory saveToPath target before fetching the object", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-dir-"));
     const target = path.join(dir, "existing-dir");
@@ -675,8 +654,8 @@ describe("S3 object tools with deterministic handler fake", () => {
 
   it("bounds the temp name by UTF-8 bytes without splitting characters", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-utf8-"));
-    // 60 four-byte characters: 244 bytes, a valid name close to NAME_MAX.
-    const name = `${"\u{1F600}".repeat(60)}.txt`;
+    // 1 + 60 * 4 + 4 = 245 bytes, close to NAME_MAX; the 64-byte cut lands mid-character.
+    const name = `a${"\u{1F600}".repeat(60)}.txt`;
     const target = path.join(dir, name);
     const opened = trackOpenedHandles();
     queueWebBody("NEW");
@@ -690,9 +669,10 @@ describe("S3 object tools with deterministic handler fake", () => {
 
       expect(result.isError).toBeFalsy();
       const tempName = path.basename(opened.paths[0] ?? "");
-      expect(tempName.startsWith(`${"\u{1F600}".repeat(16)}.b2mcp-`)).toBe(true);
+      expect(tempName.startsWith(`a${"\u{1F600}".repeat(15)}.b2mcp-`)).toBe(true);
       expect(tempName).not.toContain("\uFFFD");
-      expect(Buffer.byteLength(tempName)).toBe(64 + 24);
+      expect(Buffer.byteLength(tempName)).toBe(61 + 24);
+      expect(fs.readFileSync(target, "utf8")).toBe("NEW");
       expect(fs.readdirSync(dir)).toEqual([name]);
     } finally {
       opened.restore();
@@ -887,6 +867,41 @@ describe("S3 object tools with deterministic handler fake", () => {
     }
   });
 
+  // Runs unprivileged: CI is non-root, so the root-only test above never executes there.
+  posixIt("carries the replaced file's owner and group over to the temp file", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-chown-"));
+    const target = path.join(dir, "owned.txt");
+    fs.writeFileSync(target, "OLD\n");
+    const { uid, gid } = fs.statSync(target);
+    const chownCalls: Array<[number, number]> = [];
+    const realOpen = fs.promises.open.bind(fs.promises);
+    const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
+      const handle = await realOpen(...(args as Parameters<typeof realOpen>));
+      const realChown = handle.chown.bind(handle);
+      handle.chown = async (owner: number, group: number) => {
+        chownCalls.push([owner, group]);
+        await realChown(owner, group);
+      };
+      return handle;
+    });
+    queueWebBody("NEW");
+
+    try {
+      const result = await tools.call("s3_get_object", {
+        bucket: "b",
+        key: "hello.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(chownCalls[0]).toEqual([uid, gid]);
+      expect(fs.readFileSync(target, "utf8")).toBe("NEW");
+    } finally {
+      openSpy.mockRestore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   posixIt("replaces a dangling symlink inside the file root instead of following it", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-root-"));
     const outside = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-outside-"));
@@ -1040,6 +1055,7 @@ describe("S3 object tools with deterministic handler fake", () => {
       ...testConfig,
       fileRoot: root,
     });
+    const opened = trackOpenedHandles();
 
     try {
       const result = await sandboxed.call("s3_get_object", {
@@ -1052,8 +1068,11 @@ describe("S3 object tools with deterministic handler fake", () => {
       expect(result.isError).toBe(true);
       expectBadRequestToolError(result, /outside the allowed directory/i);
       expect(s3.requestsFor("getObject")).toHaveLength(0);
+      // Refused by the post-mkdir check, before any temp file is created.
+      expect(opened.handles).toHaveLength(0);
       expect(fs.readdirSync(escapeDir)).toEqual([]);
     } finally {
+      opened.restore();
       fs.rmSync(root, { recursive: true, force: true });
       fs.rmSync(outside, { recursive: true, force: true });
     }
@@ -1115,6 +1134,65 @@ describe("S3 object tools with deterministic handler fake", () => {
       },
     );
   }
+
+  posixIt(
+    "rejects a temp file whose path is swapped back after open (device/inode check)",
+    async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-swapback-root-"));
+      const outside = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-swapback-out-"));
+      const inner = path.join(root, "inner");
+      const link = path.join(root, "link");
+      fs.symlinkSync(inner, link);
+      const racingGuard: B2S3VersionGuard = {
+        ...versionGuard,
+        async resolveS3FileVersion() {
+          fs.mkdirSync(inner);
+          return fileVersion();
+        },
+      };
+      const sandboxed = new ToolHarness();
+      registerS3ObjectTools(sandboxed, s3.asPeerClient(), racingGuard, {
+        ...testConfig,
+        fileRoot: root,
+      });
+      // The create lands outside, then the link is restored and an in-root decoy takes the
+      // temp name, so the real path looks fine and only the device/inode match can reject it.
+      const realOpen = fs.promises.open.bind(fs.promises);
+      const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
+        fs.rmSync(link);
+        fs.symlinkSync(outside, link);
+        const handle = await realOpen(...(args as Parameters<typeof realOpen>));
+        fs.rmSync(link);
+        fs.symlinkSync(inner, link);
+        fs.writeFileSync(path.join(inner, path.basename(String(args[0]))), "decoy");
+        return handle;
+      });
+      const realPlatform = process.platform;
+      Object.defineProperty(process, "platform", { value: "darwin" });
+
+      try {
+        const result = await sandboxed.call("s3_get_object", {
+          bucket: "b",
+          key: "hello.txt",
+          versionId: "version-hello",
+          saveToPath: path.join(root, "link", "out.txt"),
+        });
+
+        expect(result.isError).toBe(true);
+        expectBadRequestToolError(result, /outside the allowed directory/i);
+        expect(s3.requestsFor("getObject")).toHaveLength(0);
+        const leftovers = fs.readdirSync(outside);
+        expect(leftovers.every((entry) => fs.statSync(path.join(outside, entry)).size === 0)).toBe(
+          true,
+        );
+      } finally {
+        Object.defineProperty(process, "platform", { value: realPlatform });
+        openSpy.mockRestore();
+        fs.rmSync(root, { recursive: true, force: true });
+        fs.rmSync(outside, { recursive: true, force: true });
+      }
+    },
+  );
 
   nonRootPosixIt("rejects a non-writable directory before fetching the object", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-ro-dir-"));
