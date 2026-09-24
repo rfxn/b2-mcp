@@ -745,6 +745,60 @@ describe("S3 object tools with deterministic handler fake", () => {
     }
   });
 
+  it("leaves a parent directory that another request created meanwhile", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-shared-"));
+    const shared = path.join(dir, "shared");
+    const target = path.join(shared, "mine", "out.txt");
+    // A concurrent request creates `shared` after it was found missing, before mkdir reaches it.
+    const realMkdir = fs.promises.mkdir.bind(fs.promises);
+    const mkdirSpy = vi.spyOn(fs.promises, "mkdir").mockImplementation(async (...args) => {
+      const level = String(args[0]);
+      if (
+        (level === shared || level.startsWith(`${shared}${path.sep}`)) &&
+        !fs.existsSync(shared)
+      ) {
+        fs.mkdirSync(shared);
+      }
+      return realMkdir(...(args as Parameters<typeof realMkdir>));
+    });
+    s3.respond("getObject", notFound());
+
+    try {
+      const result = await tools.call("s3_get_object", {
+        bucket: "b",
+        key: "missing.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBe(true);
+      expect(fs.readdirSync(dir)).toEqual(["shared"]);
+      expect(fs.readdirSync(shared)).toEqual([]);
+    } finally {
+      mkdirSpy.mockRestore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("removes the directories created before mkdir fails part-way", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-partial-"));
+    // made-a and made-b are created before the 300-byte segment fails with ENAMETOOLONG.
+    const target = path.join(dir, "made-a", "made-b", "x".repeat(300), "out.txt");
+
+    try {
+      const result = await tools.call("s3_get_object", {
+        bucket: "b",
+        key: "hello.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBe(true);
+      expect(s3.requestsFor("getObject")).toHaveLength(0);
+      expect(fs.readdirSync(dir)).toEqual([]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("cancels the body and closes the temp file when the transfer circuit is open", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-breaker-"));
     const target = path.join(dir, "out.txt");
@@ -860,6 +914,41 @@ describe("S3 object tools with deterministic handler fake", () => {
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
       fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  posixIt("checks the opened temp file with fs-guard's resolver, not the native one", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-resolver-"));
+    const target = path.join(root, "out.txt");
+    const sandboxed = new ToolHarness();
+    registerS3ObjectTools(sandboxed, s3.asPeerClient(), versionGuard, {
+      ...testConfig,
+      fileRoot: root,
+    });
+    // The native resolver can spell a path differently from the JS one fs-guard uses
+    // for the root (letter case on macOS, mapped drives on Windows). fs.realpathSync
+    // itself cannot be spied on (ESM namespace), so this mock is a tripwire.
+    const nativeRealpath = vi
+      .spyOn(fs.promises, "realpath")
+      .mockImplementation(async (p) => String(p).toUpperCase());
+    const realPlatform = process.platform;
+    Object.defineProperty(process, "platform", { value: "darwin" });
+    queueWebBody("NEW");
+
+    try {
+      const result = await sandboxed.call("s3_get_object", {
+        bucket: "b",
+        key: "hello.txt",
+        saveToPath: target,
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(nativeRealpath).not.toHaveBeenCalled();
+      expect(fs.readFileSync(target, "utf8")).toBe("NEW");
+    } finally {
+      Object.defineProperty(process, "platform", { value: realPlatform });
+      nativeRealpath.mockRestore();
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 

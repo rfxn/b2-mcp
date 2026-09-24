@@ -296,10 +296,15 @@ async function assertOpenedInsideFileRoot(
     openedPath = await fs.promises.readlink(`/proc/self/fd/${handle.fd}`).catch(() => undefined);
   }
   if (openedPath === undefined) {
-    const [opened, realPath] = await Promise.all([
-      handle.stat(),
-      fs.promises.realpath(tempPath).catch(() => undefined),
-    ]);
+    const opened = await handle.stat();
+    // Same JS resolver fs-guard applies to the root: the native one can spell the same
+    // path differently (letter case on macOS, mapped or SUBST drives on Windows).
+    let realPath: string | undefined;
+    try {
+      realPath = fs.realpathSync(tempPath);
+    } catch {
+      realPath = undefined;
+    }
     const onDisk = realPath ? await fs.promises.stat(realPath).catch(() => undefined) : undefined;
     if (onDisk && onDisk.dev === opened.dev && onDisk.ino === opened.ino) openedPath = realPath;
   }
@@ -322,16 +327,36 @@ function utf8Prefix(name: string, maxBytes: number): string {
   return prefix;
 }
 
-/** Remove directories this download created, deepest first, stopping at any non-empty one. */
-async function removeCreatedDirs(dir: string, firstCreated: string | undefined): Promise<void> {
-  if (!firstCreated) return;
-  for (let current = dir; ; current = path.dirname(current)) {
+/**
+ * `mkdir -p` for `dir`, one level at a time, recording in `createdDirs` only the
+ * directories this call itself created (EEXIST means another request made it), so
+ * cleanup never removes a directory it does not own.
+ */
+async function makeParentDirs(dir: string, createdDirs: string[]): Promise<void> {
+  const missing: string[] = [];
+  for (let current = dir; path.dirname(current) !== current; current = path.dirname(current)) {
     try {
-      await fs.promises.rmdir(current);
-    } catch {
-      return;
+      await fs.promises.lstat(current);
+      break;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") break;
+      missing.unshift(current);
     }
-    if (current === firstCreated || path.dirname(current) === current) return;
+  }
+  for (const level of missing) {
+    try {
+      await fs.promises.mkdir(level);
+      createdDirs.push(level);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    }
+  }
+}
+
+/** Remove the directories this download created, deepest first; a non-empty one stays. */
+async function removeCreatedDirs(createdDirs: readonly string[]): Promise<void> {
+  for (const created of [...createdDirs].reverse()) {
+    await fs.promises.rmdir(created).catch(() => undefined);
   }
 }
 
@@ -359,10 +384,10 @@ async function downloadToPath(
     dir,
     `${utf8Prefix(path.basename(target.path), 64)}.b2mcp-${randomBytes(6).toString("hex")}.part`,
   );
-  let firstCreatedDir: string | undefined;
+  const createdDirs: string[] = [];
   let handle: fs.promises.FileHandle;
   try {
-    firstCreatedDir = await fs.promises.mkdir(dir, { recursive: true });
+    await makeParentDirs(dir, createdDirs);
     // Re-apply the sandbox check to the now-existing directory: a symlinked
     // ancestor that was dangling when the path was vetted may have been given a
     // target outside the root since, and mkdir would then have followed it. The
@@ -373,7 +398,7 @@ async function downloadToPath(
     // contents from ever being more readable than the file they replace.
     handle = await fs.promises.open(tempPath, "wx", target.existing?.mode ?? 0o666);
   } catch (err) {
-    await removeCreatedDirs(dir, firstCreatedDir);
+    await removeCreatedDirs(createdDirs);
     if (err instanceof FileAccessError) throw badRequestError(err.message);
     throw notWritableError(err, `directory '${dir}'`);
   }
@@ -432,7 +457,7 @@ async function downloadToPath(
     await handle.close().catch(() => undefined);
     if (!committed) {
       await fs.promises.unlink(tempPath).catch(() => undefined);
-      await removeCreatedDirs(dir, firstCreatedDir);
+      await removeCreatedDirs(createdDirs);
     }
   }
 }
