@@ -1198,7 +1198,8 @@ describe("S3 object tools with deterministic handler fake", () => {
     }
   });
 
-  it("leaves an empty same-named directory left in place of one it created", async () => {
+  // Windows refuses to rename a directory that holds the open temp file.
+  posixIt("leaves an empty same-named directory left in place of one it created", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-decoy-"));
     const shared = path.join(root, "shared");
     fs.mkdirSync(shared);
