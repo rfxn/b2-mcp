@@ -1217,7 +1217,7 @@ describe("S3 object tools with deterministic handler fake", () => {
       const result = await saveTo(target, { key: "missing.txt" });
 
       expect(result.isError).toBe(true);
-      expect(fs.existsSync(level)).toBe(true);
+      expect(fs.readdirSync(level)).toEqual([]);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
