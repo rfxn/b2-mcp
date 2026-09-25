@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { Readable } from "node:stream";
 import { ReadableStream } from "node:stream/web";
 import * as fs from "node:fs";
@@ -467,7 +468,7 @@ describe("S3 object tools with deterministic handler fake", () => {
       expect(result.isError).toBe(true);
       expect(parseResult(result)).toMatch(/No object body progress/i);
       expect(destroySpy).toHaveBeenCalled();
-      expect(fs.existsSync(target)).toBe(false);
+      expect(fs.readdirSync(dir)).toEqual([]);
     } finally {
       if (previousTimeout === undefined) delete process.env.B2_S3_SAVE_TO_PATH_IDLE_TIMEOUT_MS;
       else process.env.B2_S3_SAVE_TO_PATH_IDLE_TIMEOUT_MS = previousTimeout;
@@ -604,6 +605,48 @@ describe("S3 object tools with deterministic handler fake", () => {
       expect(fs.statSync(target).isDirectory()).toBe(true);
       expect(fs.readdirSync(dir)).toEqual(["existing-dir"]);
     } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  posixIt("rejects a named pipe saveToPath target before fetching the object", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pipe-"));
+    const target = path.join(dir, "pipe");
+    // cspell:disable-next-line
+    execFileSync("mkfifo", [target]);
+
+    try {
+      const result = await saveTo(target);
+
+      expect(result.isError).toBe(true);
+      expectBadRequestToolError(result, /regular file.*not a regular file/i);
+      expect(s3.requestsFor("getObject")).toHaveLength(0);
+      expect(fs.statSync(target).isFIFO()).toBe(true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  posixIt("creates the temp file exclusively instead of following a link at its name", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-excl-"));
+    const target = path.join(dir, "out.txt");
+    const victim = path.join(dir, "victim.txt");
+    fs.writeFileSync(victim, "VICTIM\n");
+    const realOpen = fs.promises.open.bind(fs.promises);
+    const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
+      if (String(args[0]).endsWith(".part")) fs.symlinkSync(victim, String(args[0]));
+      return realOpen(...(args as Parameters<typeof realOpen>));
+    });
+    queueWebBody("NEW");
+
+    try {
+      const result = await saveTo(target);
+
+      expect(result.isError).toBe(true);
+      expect(fs.readFileSync(victim, "utf8")).toBe("VICTIM\n");
+      expect(fs.existsSync(target)).toBe(false);
+    } finally {
+      openSpy.mockRestore();
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -748,6 +791,8 @@ describe("S3 object tools with deterministic handler fake", () => {
   });
 
   it("fails a temp file write that makes no progress instead of retrying it", async () => {
+    const previousTimeout = process.env.B2_S3_SAVE_TO_PATH_IDLE_TIMEOUT_MS;
+    process.env.B2_S3_SAVE_TO_PATH_IDLE_TIMEOUT_MS = "200";
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-stuck-"));
     const target = path.join(dir, "out.txt");
     fs.writeFileSync(target, "KEEP\n");
@@ -775,6 +820,8 @@ describe("S3 object tools with deterministic handler fake", () => {
       expect(fs.readFileSync(target, "utf8")).toBe("KEEP\n");
       expect(fs.readdirSync(dir)).toEqual(["out.txt"]);
     } finally {
+      if (previousTimeout === undefined) delete process.env.B2_S3_SAVE_TO_PATH_IDLE_TIMEOUT_MS;
+      else process.env.B2_S3_SAVE_TO_PATH_IDLE_TIMEOUT_MS = previousTimeout;
       openSpy.mockRestore();
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -1191,7 +1238,7 @@ describe("S3 object tools with deterministic handler fake", () => {
 
       expect(result.isError).toBe(true);
       expectBadRequestToolError(result, /outside the allowed directory/i);
-      expect(fs.existsSync(path.join(outside, "sub", "out.txt"))).toBe(false);
+      expect(fs.readdirSync(path.join(outside, "sub"))).toEqual([]);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
       fs.rmSync(outside, { recursive: true, force: true });
@@ -1371,6 +1418,11 @@ describe("S3 object tools with deterministic handler fake", () => {
       change: (target: string) => fs.writeFileSync(target, "OTHER\n"),
       left: "OTHER\n",
     },
+    {
+      name: "was removed",
+      change: (target: string) => fs.rmSync(target),
+      left: null,
+    },
   ];
   for (const { name, absent, change, left } of destinationChanges) {
     posixIt(`refuses to replace a destination that ${name} mid-download`, async () => {
@@ -1393,8 +1445,44 @@ describe("S3 object tools with deterministic handler fake", () => {
 
         expect(result.isError).toBe(true);
         expectBadRequestToolError(result, /target .* changed while the download was in flight/i);
-        expect(fs.readFileSync(target, "utf8")).toBe(left);
+        expect(fs.existsSync(target) ? fs.readFileSync(target, "utf8") : null).toBe(left);
       } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  // Only root can chown to another user, so the changed owner is faked by inode.
+  for (const field of ["uid", "gid"] as const) {
+    posixIt(`refuses to replace a destination whose ${field} changed mid-download`, async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-dest-owner-"));
+      const target = path.join(dir, "out.txt");
+      fs.writeFileSync(target, "KEEP\n");
+      const vetted = fs.statSync(target);
+      let lstatSpy: { mockRestore: () => void } | undefined;
+      s3.respond("getObject", () => {
+        const real = fs.promises.lstat.bind(fs.promises) as typeof fs.promises.lstat;
+        lstatSpy = vi.spyOn(fs.promises, "lstat").mockImplementation(async (...args) => {
+          const stat = await real(...(args as Parameters<typeof real>));
+          if (stat.ino === vetted.ino) {
+            Object.defineProperty(stat, field, { value: vetted[field] + 1 });
+          }
+          return stat;
+        });
+        return downloadedObject({
+          contentLength: 3,
+          body: streamFrom([new TextEncoder().encode("NEW")]),
+        });
+      });
+
+      try {
+        const result = await saveTo(target);
+
+        expect(result.isError).toBe(true);
+        expectBadRequestToolError(result, /target .* changed while the download was in flight/i);
+        expect(fs.readFileSync(target, "utf8")).toBe("KEEP\n");
+      } finally {
+        lstatSpy?.mockRestore();
         fs.rmSync(dir, { recursive: true, force: true });
       }
     });
