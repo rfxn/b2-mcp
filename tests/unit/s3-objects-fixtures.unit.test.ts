@@ -693,7 +693,7 @@ describe("S3 object tools with deterministic handler fake", () => {
     }
   });
 
-  it("leaves no temp file, open handle, or created directory when the body is missing", async () => {
+  it("leaves no temp file or open handle when the body is missing", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-nobody-"));
     const target = path.join(dir, "a", "b", "out.txt");
     const opened = trackOpenedHandles();
@@ -707,54 +707,24 @@ describe("S3 object tools with deterministic handler fake", () => {
       // The temp file plus, on Linux, the parent directory pinned for the rename.
       expect(opened.paths.some((opened) => opened.endsWith(".part"))).toBe(true);
       expect(opened.handles.map((handle) => handle.fd)).toEqual(opened.handles.map(() => -1));
-      expect(fs.readdirSync(dir)).toEqual([]);
+      expect(fs.readdirSync(path.join(dir, "a", "b"))).toEqual([]);
     } finally {
       opened.restore();
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it("leaves a parent directory that another request created meanwhile", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-shared-"));
-    const shared = path.join(dir, "shared");
-    const target = path.join(shared, "mine", "out.txt");
-    // A concurrent request creates `shared` after it was found missing, before mkdir reaches it.
-    const realMkdir = fs.promises.mkdir.bind(fs.promises);
-    const mkdirSpy = vi.spyOn(fs.promises, "mkdir").mockImplementation(async (...args) => {
-      const level = String(args[0]);
-      if (
-        (level === shared || level.startsWith(`${shared}${path.sep}`)) &&
-        !fs.existsSync(shared)
-      ) {
-        fs.mkdirSync(shared);
-      }
-      return realMkdir(...(args as Parameters<typeof realMkdir>));
-    });
-    s3.respond("getObject", notFound());
-
-    try {
-      const result = await saveTo(target, { key: "missing.txt" });
-
-      expect(result.isError).toBe(true);
-      expect(fs.readdirSync(dir)).toEqual(["shared"]);
-      expect(fs.readdirSync(shared)).toEqual([]);
-    } finally {
-      mkdirSpy.mockRestore();
-      fs.rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("removes the directories created before mkdir fails part-way", async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-partial-"));
-    // made-a and made-b are created before the 300-byte segment fails with ENAMETOOLONG.
-    const target = path.join(dir, "made-a", "made-b", "x".repeat(300), "out.txt");
+  it("refuses a parent directory it cannot create before fetching", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-parent-"));
+    // made is created, then the 300-byte segment fails with ENAMETOOLONG.
+    const target = path.join(dir, "made", "x".repeat(300), "out.txt");
 
     try {
       const result = await saveTo(target);
 
-      expect(result.isError).toBe(true);
+      expectBadRequestToolError(result, /directory .* cannot be written \(ENAMETOOLONG\)/);
       expect(s3.requestsFor("getObject")).toHaveLength(0);
-      expect(fs.readdirSync(dir)).toEqual([]);
+      expect(fs.readdirSync(dir)).toEqual(["made"]);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -1246,30 +1216,6 @@ describe("S3 object tools with deterministic handler fake", () => {
   });
 
   // Windows refuses to rename a directory that holds the open temp file.
-  posixIt("leaves an empty same-named directory left in place of one it created", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-decoy-"));
-    const shared = path.join(root, "shared");
-    fs.mkdirSync(shared);
-    const level = path.join(shared, "x");
-    const target = path.join(level, "out.txt");
-    // The created level is moved aside and an empty decoy left under its name, so only
-    // an inode check can tell that the name no longer holds what this download made.
-    s3.respond("getObject", () => {
-      fs.renameSync(level, `${level}.moved`);
-      fs.mkdirSync(level);
-      throw notFound();
-    });
-
-    try {
-      const result = await saveTo(target, { key: "missing.txt" });
-
-      expect(result.isError).toBe(true);
-      expect(fs.readdirSync(level)).toEqual([]);
-    } finally {
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  });
-
   it("keeps the directories it created under a file root", async () => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-off-")));
     const sandboxed = sandboxedTools(root);

@@ -399,49 +399,6 @@ function utf8Prefix(name: string, maxBytes: number): string {
   return prefix;
 }
 
-interface CreatedDir {
-  path: string;
-  dev: number;
-  ino: number;
-}
-
-// mkdir -p that records the levels this call created, so cleanup skips ones that already existed.
-async function makeParentDirs(dir: string, createdDirs: CreatedDir[]): Promise<void> {
-  const missing: string[] = [];
-  for (let current = dir; path.dirname(current) !== current; current = path.dirname(current)) {
-    try {
-      await fs.promises.lstat(current);
-      break;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") break;
-      missing.unshift(current);
-    }
-  }
-  for (const level of missing) {
-    try {
-      await fs.promises.mkdir(level);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-      continue;
-    }
-    const made = await fs.promises.lstat(level).catch(ignoreError);
-    if (made) createdDirs.push({ path: level, dev: made.dev, ino: made.ino });
-  }
-}
-
-async function removeCreatedDirs(
-  createdDirs: readonly CreatedDir[],
-  sandbox?: B2Config,
-): Promise<void> {
-  // Kept under a file root: a swapped or moved ancestor could aim the removal outside it.
-  if (sandbox) return;
-  for (const created of [...createdDirs].reverse()) {
-    const onDisk = await fs.promises.lstat(created.path).catch(ignoreError);
-    if (!onDisk?.isDirectory() || onDisk.dev !== created.dev || onDisk.ino !== created.ino) return;
-    await fs.promises.rmdir(created.path).catch(ignoreError);
-  }
-}
-
 // Node has no renameat2, so a change between these checks and the rename goes undetected.
 async function assertCommitStillMatchesVetting(
   target: SaveToPathTarget,
@@ -494,10 +451,9 @@ async function downloadToPath(
   // 64 bytes of the name plus a 24-byte suffix stays under a 255-byte NAME_MAX.
   const tempName = `${utf8Prefix(path.basename(target.path), 64)}.b2mcp-${randomBytes(6).toString("hex")}.part`;
   const tempPath = path.join(dir, tempName);
-  const createdDirs: CreatedDir[] = [];
   let handle: fs.promises.FileHandle;
   try {
-    await makeParentDirs(dir, createdDirs);
+    await fs.promises.mkdir(dir, { recursive: true });
     // mkdir follows an ancestor link that was dangling at vetting and may now point out.
     if (sandbox) resolveLocalPath(sandbox, dir, "write");
     // Owner bits only until the chmod below, so a refused chmod cannot widen access.
@@ -507,7 +463,6 @@ async function downloadToPath(
       target.existing ? target.existing.mode & 0o700 : 0o666,
     );
   } catch (err) {
-    await removeCreatedDirs(createdDirs, sandbox);
     if (err instanceof FileAccessError) throw badRequestError(err.message);
     throw notWritableError(err, `directory '${dir}'`);
   }
@@ -516,8 +471,6 @@ async function downloadToPath(
   let writeStream: Writable | undefined;
   let committed = false;
   let anchor: CommitAnchor | undefined;
-  // Until the opened file and its directory are confirmed, a swap could aim cleanup elsewhere.
-  let cleanupIsSafe = false;
   let tempId: { dev: number; ino: number } | undefined;
   try {
     const opened = await handle.stat();
@@ -526,7 +479,6 @@ async function downloadToPath(
     const pin = await pinParentDir(dir, handle, tempName, sandbox);
     if (pin.kind === "pinned") anchor = { handle: pin.handle };
     if (pin.kind === "refused") throw badRequestError(pin.message);
-    cleanupIsSafe = true;
     if (target.existing) {
       const kept = await preserveOwnership(handle, target.existing);
       // Best effort: FAT and SMB mounts may refuse fchmod.
@@ -590,7 +542,6 @@ async function downloadToPath(
     }
     writeStream?.destroy();
     await handle.close().catch(ignoreError);
-    if (!committed && cleanupIsSafe) await removeCreatedDirs(createdDirs, sandbox);
     await anchor?.handle.close().catch(ignoreError);
   }
 }
