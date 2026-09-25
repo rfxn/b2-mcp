@@ -334,7 +334,7 @@ type ParentPin =
   | { kind: "unavailable" }
   | { kind: "refused"; message: string };
 
-// Holds the parent so a swapped ancestor cannot redirect the rename or cleanup (Linux).
+// Holds the parent so a swapped ancestor cannot redirect the rename or temp unlink (Linux).
 async function pinParentDir(
   dir: string,
   handle: fs.promises.FileHandle,
@@ -405,7 +405,7 @@ interface CreatedDir {
   ino: number;
 }
 
-// mkdir -p that records only the levels this call created, so cleanup never takes others.
+// mkdir -p that records the levels this call created, so cleanup skips ones that already existed.
 async function makeParentDirs(dir: string, createdDirs: CreatedDir[]): Promise<void> {
   const missing: string[] = [];
   for (let current = dir; path.dirname(current) !== current; current = path.dirname(current)) {

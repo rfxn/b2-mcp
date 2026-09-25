@@ -661,7 +661,7 @@ describe("S3 object tools with deterministic handler fake", () => {
 
       expect(result.isError).toBe(true);
       expect(parseResult(result)).toMatch(/readable body/i);
-      // The temp file plus every directory pinned for the rename and the cleanup.
+      // The temp file plus, on Linux, the parent directory pinned for the rename.
       expect(opened.paths.some((opened) => opened.endsWith(".part"))).toBe(true);
       expect(opened.handles.map((handle) => handle.fd)).toEqual(opened.handles.map(() => -1));
       expect(fs.readdirSync(dir)).toEqual([]);
@@ -1291,7 +1291,7 @@ describe("S3 object tools with deterministic handler fake", () => {
       contentLength: 10,
       body: () => streamFrom([new TextEncoder().encode("NEW")]),
     },
-    // Fails mid-stream, so the transfer tears its streams down before cleanup.
+    // The body errors, so the transfer tears its streams down before cleanup.
     {
       name: "removed after a body error",
       op: "unlink",
@@ -1448,7 +1448,7 @@ describe("S3 object tools with deterministic handler fake", () => {
         /cannot open the directory .* \(EACCES\), which is required/i,
       );
       expect(s3.requestsFor("getObject")).toHaveLength(0);
-      // Left in place: the directory they were created in was never confirmed.
+      // Left in place: directories created under a file root are never removed.
       expect(fs.readdirSync(dir)).toEqual([]);
     } finally {
       openSpy.mockRestore();
