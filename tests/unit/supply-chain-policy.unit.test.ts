@@ -107,29 +107,18 @@ describe("supply-chain audit policy", () => {
   type LockPackageWithMetadata = LockPackage & { integrity: string; version: string };
   const lock = readPackageManagerLock(root) as { packages: Record<string, LockPackage> };
 
-  it("keeps the fresh Backblaze SDK release-age exception time-bounded", () => {
-    const sdkVersion = packageJson.dependencies["@backblaze-labs/b2-sdk"];
-    const excludedPackage = `@backblaze-labs/b2-sdk@${sdkVersion}`;
-    const rootExcludes = pnpmWorkspace.minimumReleaseAgeExclude ?? [];
-    const customerHostedExcludes = customerHostedPnpmWorkspace.minimumReleaseAgeExclude ?? [];
-    const exceptionExpiresAt = "2026-09-16T19:00:00.000Z";
+  it("drops the expired Backblaze SDK release-age exception from both workspaces", () => {
+    const sdkPackage = `@backblaze-labs/b2-sdk@${packageJson.dependencies["@backblaze-labs/b2-sdk"]}`;
+    const sdkExcludes = [
+      ...(pnpmWorkspace.minimumReleaseAgeExclude ?? []),
+      ...(customerHostedPnpmWorkspace.minimumReleaseAgeExclude ?? []),
+    ].filter((entry) => entry.startsWith("@backblaze-labs/b2-sdk@"));
+    const integrity = rawPnpmLock.packages?.[sdkPackage]?.resolution?.integrity;
 
-    expect(rootExcludes).toContain(excludedPackage);
-    expect(customerHostedExcludes).toContain(excludedPackage);
-    expect(rootExcludes.filter((entry) => entry.startsWith("@backblaze-labs/b2-sdk@"))).toEqual([
-      excludedPackage,
-    ]);
-    expect(
-      customerHostedExcludes.filter((entry) => entry.startsWith("@backblaze-labs/b2-sdk@")),
-    ).toEqual([excludedPackage]);
-    expect(Date.now()).toBeLessThan(Date.parse(exceptionExpiresAt));
-
-    const lockEntry = rawPnpmLock.packages?.[excludedPackage];
-    const integrity = lockEntry?.resolution?.integrity;
-
+    expect(sdkExcludes).toEqual([]);
     expect(integrity).toBeTruthy();
-    expect(sdkAdoptionContract).toContain(excludedPackage);
-    expect(sdkAdoptionContract).toContain(exceptionExpiresAt);
+    expect(sdkAdoptionContract).toContain(sdkPackage);
+    expect(sdkAdoptionContract).toContain("2026-09-16T19:00:00.000Z");
     expect(sdkAdoptionContract).toContain("SLSA v1 attestation");
     expect(sdkAdoptionContract).toContain(String(integrity));
     expect(sdkAdoptionContract).toContain(
