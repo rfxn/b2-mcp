@@ -27,7 +27,6 @@ minimumReleaseAgeExclude:
   - '@vercel/vc-native-linux-x64@59.3.0'
   - vercel@59.3.0
   # Time-bounded SDK release-age exception documented in docs/design-docs/sdk-adoption-contract.md.
-  - '@backblaze-labs/b2-sdk@0.4.0'
 overrides:
   # Force the dev-only mcpb packer's interactive-editor path off vulnerable
   # tmp 0.0.33 (GHSA path-traversal); mcpb pack never prompts, but the audit
