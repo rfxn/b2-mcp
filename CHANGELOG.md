@@ -12,18 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   b2-sdk-typescript, and b2-action. (#427)
 
 ### Fixed
-- `s3_get_object` `saveToPath` no longer truncates or deletes an existing file
-  when a download fails: bytes stream to a sibling temp file that is renamed into
-  place only on success, a body that ends short of a reported content length fails
-  with `incomplete_download` (HTTP 502), and the success message reports the bytes
-  actually written. A replaced file keeps its permission bits, and its owner and
-  group where the process may set them. Under `B2_FILE_ROOT` the write no longer
-  follows a symlink out of the root, and on Linux the commit and cleanup run
-  relative to a held descriptor for the verified parent directory; a temp file or
-  destination that changed while the body was in flight is refused rather than
-  committed. Because the file is replaced rather than rewritten, hard links,
-  extended attributes, and ACLs are not carried over, and a target that cannot be
-  renamed over now fails with `bad_request`. (#449)
+- `s3_get_object` `saveToPath` no longer destroys an existing file when a
+  download fails, or follows a dangling symlink out of `B2_FILE_ROOT`. Files are
+  now replaced via a sibling temp file, which drops hard links, ACLs, extended
+  attributes, and any ownership the server cannot set. (#449)
 
 ## [0.2.1] - 2026-09-04
 
