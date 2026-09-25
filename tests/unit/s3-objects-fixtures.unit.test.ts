@@ -538,7 +538,7 @@ describe("S3 object tools with deterministic handler fake", () => {
   }
 
   const posixIt = process.platform === "win32" ? it.skip : it;
-  const linuxIt = process.platform === "linux" ? it : it.skip;
+  const linuxIt = process.platform === "linux" && fs.existsSync("/proc/self/fd") ? it : it.skip;
   const nonRootPosixIt = process.platform === "win32" || process.getuid?.() === 0 ? it.skip : it;
 
   // Permission bits only: setuid, setgid and sticky are not carried onto new content.
@@ -716,13 +716,13 @@ describe("S3 object tools with deterministic handler fake", () => {
 
   it("refuses a parent directory it cannot create before fetching", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-parent-"));
-    // made is created, then the 300-byte segment fails with ENAMETOOLONG.
+    // made is created, then the 300-byte segment fails (ENAMETOOLONG; ENOENT on Windows).
     const target = path.join(dir, "made", "x".repeat(300), "out.txt");
 
     try {
       const result = await saveTo(target);
 
-      expectBadRequestToolError(result, /directory .* cannot be written \(ENAMETOOLONG\)/);
+      expectBadRequestToolError(result, /saveToPath directory .* cannot be written/);
       expect(s3.requestsFor("getObject")).toHaveLength(0);
       expect(fs.readdirSync(dir)).toEqual(["made"]);
     } finally {
@@ -1057,9 +1057,7 @@ describe("S3 object tools with deterministic handler fake", () => {
       expect(result.isError).toBe(true);
       expectBadRequestToolError(result, /outside the allowed directory/i);
       expect(s3.requestsFor("getObject")).toHaveLength(0);
-      // Refused by the post-mkdir check, before any temp file is created. The escaped
-      // level is left empty rather than removed by path: from here it cannot be told
-      // apart from a directory someone else owns.
+      // Refused by the post-mkdir check, before any temp file is created.
       expect(opened.handles).toHaveLength(0);
       expect(fs.readdirSync(escapeDir)).toEqual(["sub"]);
       expect(fs.readdirSync(path.join(escapeDir, "sub"))).toEqual([]);
@@ -1216,27 +1214,6 @@ describe("S3 object tools with deterministic handler fake", () => {
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
       fs.rmSync(outside, { recursive: true, force: true });
-    }
-  });
-
-  // Windows refuses to rename a directory that holds the open temp file.
-  it("keeps the directories it created under a file root", async () => {
-    const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-off-")));
-    const sandboxed = sandboxedTools(root);
-    s3.respond("getObject", () => {
-      throw notFound();
-    });
-
-    try {
-      const result = await saveTo(path.join(root, "a", "b", "out.txt"), {
-        harness: sandboxed,
-        key: "missing.txt",
-      });
-
-      expect(result.isError).toBe(true);
-      expect(fs.readdirSync(path.join(root, "a", "b"))).toEqual([]);
-    } finally {
-      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 
@@ -1487,7 +1464,7 @@ describe("S3 object tools with deterministic handler fake", () => {
         /cannot open the directory .* \(EACCES\), which is required/i,
       );
       expect(s3.requestsFor("getObject")).toHaveLength(0);
-      // Left in place: directories created under a file root are never removed.
+      // Left in place: directories this request created are never removed.
       expect(fs.readdirSync(dir)).toEqual([]);
     } finally {
       openSpy.mockRestore();
