@@ -1159,9 +1159,11 @@ describe("S3 object tools with deterministic handler fake", () => {
     fs.writeFileSync(target, "OLD\n");
     fs.chmodSync(target, 0o666);
     const sandboxed = sandboxedTools(root);
+    const handles: fs.promises.FileHandle[] = [];
     const realOpen = fs.promises.open.bind(fs.promises);
     const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
       const handle = await realOpen(...(args as Parameters<typeof realOpen>));
+      handles.push(handle);
       const opened = String(args[0]);
       if (opened.endsWith(".part")) {
         fs.linkSync(opened, path.join(outside, path.basename(opened)));
@@ -1179,6 +1181,8 @@ describe("S3 object tools with deterministic handler fake", () => {
       expectBadRequestToolError(result, /outside the allowed directory/i);
       expect(s3.requestsFor("getObject")).toHaveLength(0);
       expect(fs.existsSync(path.join(outside, "out.txt"))).toBe(false);
+      // The temp file and the refused directory pin are both closed.
+      expect(handles.map((handle) => handle.fd)).toEqual([-1, -1]);
     } finally {
       openSpy.mockRestore();
       fs.rmSync(root, { recursive: true, force: true });
