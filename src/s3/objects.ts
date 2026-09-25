@@ -359,9 +359,13 @@ async function pinParentDir(
   let dirHandle: fs.promises.FileHandle;
   try {
     dirHandle = await fs.promises.open(dir, PIN_DIR_FLAGS);
-  } catch {
+  } catch (err) {
     // e.g. a writable directory the process cannot list (a 0333 drop box).
-    return sandbox ? changed : { kind: "unavailable" };
+    if (!sandbox) return { kind: "unavailable" };
+    const code = (err as NodeJS.ErrnoException).code ?? "unknown error";
+    return refusal(
+      `saveToPath cannot open the directory '${dir}' (${code}), which is required under ${sandbox.fileRoot}.`,
+    );
   }
   const refuse = async (result: ParentPin): Promise<ParentPin> => {
     await dirHandle.close().catch(() => undefined);

@@ -1442,7 +1442,10 @@ describe("S3 object tools with deterministic handler fake", () => {
       const result = await saveTo(path.join(dir, "out.txt"), { harness: sandboxed });
 
       expect(result.isError).toBe(true);
-      expectBadRequestToolError(result, /changed while the download was being prepared/i);
+      expectBadRequestToolError(
+        result,
+        /cannot open the directory .* \(EACCES\), which is required/i,
+      );
       expect(s3.requestsFor("getObject")).toHaveLength(0);
       // Left in place: the directory they were created in was never confirmed.
       expect(fs.readdirSync(dir)).toEqual([]);
