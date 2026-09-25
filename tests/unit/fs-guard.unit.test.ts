@@ -123,10 +123,15 @@ describe("isInsideFileRoot", () => {
   });
 
   it("compares a resolved path against the real root without resolving it again", () => {
-    const cfg = { ...baseConfig, fileRoot: root };
-    const realRoot = fs.realpathSync(root);
+    const rootLink = path.join(outside, "root-link");
+    fs.symlinkSync(root, rootLink);
+    const cfg = { ...baseConfig, fileRoot: rootLink };
+    const realRoot = fs.realpathSync(rootLink);
+    fs.symlinkSync(outside, path.join(root, "escape"));
     expect(isInsideFileRoot(cfg, realRoot)).toBe(true);
     expect(isInsideFileRoot(cfg, path.join(realRoot, "a", "b.txt"))).toBe(true);
+    // Taken as already resolved: following `escape` again would leave the root.
+    expect(isInsideFileRoot(cfg, path.join(realRoot, "escape", "f.txt"))).toBe(true);
     expect(isInsideFileRoot(cfg, fs.realpathSync(outside))).toBe(false);
     expect(isInsideFileRoot(cfg, `${realRoot}-sibling`)).toBe(false);
   });
