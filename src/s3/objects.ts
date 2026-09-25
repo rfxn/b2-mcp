@@ -274,6 +274,7 @@ async function preserveOwnership(
 // A lost owner or group can move a user into another class, so carry only shared bits.
 function modeCarriedSafely(mode: number, kept: { uid: boolean; gid: boolean }): number {
   if (kept.uid && kept.gid) return mode;
+  // Owner bits pass through; capping them to the server's old access needs group lookups.
   const owner = (mode >> 6) & 0o7;
   const group = (mode >> 3) & 0o7;
   const other = mode & 0o7;
