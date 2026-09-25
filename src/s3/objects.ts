@@ -219,10 +219,10 @@ function notWritableError(err: unknown, what: string): unknown {
 
 async function prepareSaveToPathTarget(
   safePath: string,
-  sandboxed: boolean,
+  sandbox?: B2Config,
 ): Promise<SaveToPathTarget> {
   // Already resolved under a sandbox; resolving again could follow a swapped link.
-  const target = sandboxed ? safePath : await fs.promises.realpath(safePath).catch(() => safePath);
+  const target = sandbox ? safePath : await fs.promises.realpath(safePath).catch(() => safePath);
   let stat: fs.Stats;
   try {
     stat = await fs.promises.stat(target);
@@ -313,16 +313,9 @@ async function assertOpenedInsideFileRoot(
   }
 }
 
-interface CommitAnchor {
-  handle: fs.promises.FileHandle;
-}
-
 function atDirFd(dirFd: number, name: string): string {
   return `/proc/self/fd/${dirFd}/${name}`;
 }
-
-// O_DIRECTORY follows symlinks; the temp inode check is what confirms the pin.
-const PIN_DIR_FLAGS = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY;
 
 // Re-read on every use: a pinned directory can be moved out of the root.
 async function pinnedDirInsideRoot(dirFd: number, sandbox?: B2Config): Promise<boolean> {
@@ -331,61 +324,49 @@ async function pinnedDirInsideRoot(dirFd: number, sandbox?: B2Config): Promise<b
   return realDir !== undefined && isInsideFileRoot(sandbox, realDir);
 }
 
-type ParentPin =
-  | { kind: "pinned"; handle: fs.promises.FileHandle }
-  | { kind: "unavailable" }
-  | { kind: "refused"; message: string };
-
 // Holds the parent so a swapped ancestor cannot redirect the rename or temp unlink (Linux).
 async function pinParentDir(
   dir: string,
   handle: fs.promises.FileHandle,
   tempName: string,
+  tempId: { dev: number; ino: number },
   sandbox?: B2Config,
-): Promise<ParentPin> {
-  if (process.platform !== "linux") return { kind: "unavailable" };
-  const refusal = (message: string) => ({ kind: "refused" as const, message });
-  const changed = refusal(
-    `The saveToPath directory '${dir}' changed while the download was being prepared.`,
-  );
+): Promise<fs.promises.FileHandle | undefined> {
+  if (process.platform !== "linux") return undefined;
   if ((await fs.promises.readlink(`/proc/self/fd/${handle.fd}`).catch(ignoreError)) === undefined) {
     // A sandboxed request fails rather than falling back to path-based operations.
-    return sandbox
-      ? refusal(
-          `saveToPath cannot be completed safely under ${sandbox.fileRoot} on this host: /proc is unavailable.`,
-        )
-      : { kind: "unavailable" };
+    if (!sandbox) return undefined;
+    throw badRequestError(
+      `saveToPath cannot be completed safely under ${sandbox.fileRoot} on this host: /proc is unavailable.`,
+    );
   }
   let dirHandle: fs.promises.FileHandle;
   try {
-    dirHandle = await fs.promises.open(dir, PIN_DIR_FLAGS);
+    // O_DIRECTORY follows symlinks; the temp inode check is what confirms the pin.
+    dirHandle = await fs.promises.open(dir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
   } catch (err) {
     // e.g. a writable directory the process cannot list (a 0333 drop box).
-    if (!sandbox) return { kind: "unavailable" };
+    if (!sandbox) return undefined;
     const code = (err as NodeJS.ErrnoException).code ?? "unknown error";
-    return refusal(
+    throw badRequestError(
       `saveToPath cannot open the directory '${dir}' (${code}), which is required under ${sandbox.fileRoot}.`,
     );
   }
-  const refuse = async (result: ParentPin): Promise<ParentPin> => {
-    await dirHandle.close().catch(ignoreError);
-    return result;
-  };
+  const changed = `The saveToPath directory '${dir}' changed while the download was being prepared.`;
+  let refusal: string | undefined;
   try {
-    const opened = await handle.stat();
     const viaPin = await fs.promises.stat(atDirFd(dirHandle.fd, tempName));
-    if (viaPin.dev !== opened.dev || viaPin.ino !== opened.ino) return await refuse(changed);
-    if (!(await pinnedDirInsideRoot(dirHandle.fd, sandbox))) {
-      return await refuse(
-        refusal(
-          `Path is outside the allowed directory (${sandbox?.fileRoot}); the saveToPath directory changed while the download was being prepared.`,
-        ),
-      );
+    if (viaPin.dev !== tempId.dev || viaPin.ino !== tempId.ino) {
+      refusal = changed;
+    } else if (!(await pinnedDirInsideRoot(dirHandle.fd, sandbox))) {
+      refusal = `Path is outside the allowed directory (${sandbox?.fileRoot}); the saveToPath directory changed while the download was being prepared.`;
     }
-    return { kind: "pinned", handle: dirHandle };
   } catch {
-    return await refuse(changed);
+    refusal = changed;
   }
+  if (refusal === undefined) return dirHandle;
+  await dirHandle.close().catch(ignoreError);
+  throw badRequestError(refusal);
 }
 
 function utf8Prefix(name: string, maxBytes: number): string {
@@ -402,13 +383,12 @@ function utf8Prefix(name: string, maxBytes: number): string {
 // Node has no renameat2, so a change between these checks and the rename goes undetected.
 async function assertCommitStillMatchesVetting(
   target: SaveToPathTarget,
-  anchor: CommitAnchor | undefined,
-  tempId: { dev: number; ino: number },
+  pinnedDir: fs.promises.FileHandle | undefined,
   tempName: string,
-  tempPath: string,
+  tempId: { dev: number; ino: number },
 ): Promise<void> {
-  const dir = path.dirname(tempPath);
-  const at = (name: string) => (anchor ? atDirFd(anchor.handle.fd, name) : path.join(dir, name));
+  const dir = path.dirname(target.path);
+  const at = (name: string) => (pinnedDir ? atDirFd(pinnedDir.fd, name) : path.join(dir, name));
   const temp = await fs.promises.lstat(at(tempName)).catch(ignoreError);
   if (temp?.dev !== tempId.dev || temp.ino !== tempId.ino) {
     throw badRequestError(
@@ -468,17 +448,13 @@ async function downloadToPath(
   }
 
   let body: B2S3ObjectBody | undefined;
-  let writeStream: Writable | undefined;
   let committed = false;
-  let anchor: CommitAnchor | undefined;
+  let pinnedDir: fs.promises.FileHandle | undefined;
   let tempId: { dev: number; ino: number } | undefined;
   try {
-    const opened = await handle.stat();
-    tempId = { dev: opened.dev, ino: opened.ino };
+    tempId = await handle.stat();
     if (sandbox) await assertOpenedInsideFileRoot(handle, tempPath, sandbox);
-    const pin = await pinParentDir(dir, handle, tempName, sandbox);
-    if (pin.kind === "pinned") anchor = { handle: pin.handle };
-    if (pin.kind === "refused") throw badRequestError(pin.message);
+    pinnedDir = await pinParentDir(dir, handle, tempName, tempId, sandbox);
     if (target.existing) {
       const kept = await preserveOwnership(handle, target.existing);
       // Best effort: FAT and SMB mounts may refuse fchmod.
@@ -493,7 +469,6 @@ async function downloadToPath(
           writeFully(handle, chunk).then(() => callback(), callback);
         },
       });
-      writeStream = stream;
       const written = await withBodyReadAbort(object.body, () =>
         pipelineBodyToFileWithIdleTimeout(object.body, stream),
       );
@@ -507,21 +482,20 @@ async function downloadToPath(
       return written;
     });
     await handle.sync();
-    if (anchor && !(await pinnedDirInsideRoot(anchor.handle.fd, sandbox))) {
+    if (pinnedDir && !(await pinnedDirInsideRoot(pinnedDir.fd, sandbox))) {
       throw badRequestError(
         `Path is outside the allowed directory (${sandbox?.fileRoot}); the saveToPath directory was moved while the download was in flight.`,
       );
     }
-    await assertCommitStillMatchesVetting(target, anchor, tempId, tempName, tempPath);
+    await assertCommitStillMatchesVetting(target, pinnedDir, tempName, tempId);
     try {
-      await (anchor
+      await (pinnedDir
         ? fs.promises.rename(
-            atDirFd(anchor.handle.fd, tempName),
-            atDirFd(anchor.handle.fd, path.basename(target.path)),
+            atDirFd(pinnedDir.fd, tempName),
+            atDirFd(pinnedDir.fd, path.basename(target.path)),
           )
         : fs.promises.rename(tempPath, target.path));
     } catch (err) {
-      // e.g. a sticky directory, an append-only file, or a Windows file lock.
       throw notWritableError(err, `target '${target.path}'`);
     }
     committed = true;
@@ -534,15 +508,14 @@ async function downloadToPath(
   } finally {
     // Unlinked while the handle is still open, so the temp file keeps its identity.
     if (!committed) {
-      const temp = anchor ? atDirFd(anchor.handle.fd, tempName) : tempPath;
+      const temp = pinnedDir ? atDirFd(pinnedDir.fd, tempName) : tempPath;
       const entry = await fs.promises.lstat(temp).catch(ignoreError);
       if (entry && entry.dev === tempId?.dev && entry.ino === tempId.ino) {
         await fs.promises.unlink(temp).catch(ignoreError);
       }
     }
-    writeStream?.destroy();
     await handle.close().catch(ignoreError);
-    await anchor?.handle.close().catch(ignoreError);
+    await pinnedDir?.close().catch(ignoreError);
   }
 }
 
@@ -943,11 +916,12 @@ export function registerS3ObjectTools(
     },
     async (args) => {
       try {
+        const sandbox = config.fileRoot ? config : undefined;
         // Vetted before any request, so a rejected path never leaves an open body behind.
         const saveTarget = args.saveToPath
           ? await prepareSaveToPathTarget(
               resolveLocalPath(config, args.saveToPath, "write"),
-              Boolean(config.fileRoot),
+              sandbox,
             )
           : undefined;
         await verifyVersionBinding(
@@ -969,11 +943,7 @@ export function registerS3ObjectTools(
 
         // Stream straight to disk for saveToPath — no full-object buffering.
         if (saveTarget) {
-          const bytes = await downloadToPath(
-            saveTarget,
-            getObject,
-            config.fileRoot ? config : undefined,
-          );
+          const bytes = await downloadToPath(saveTarget, getObject, sandbox);
           return toolSuccess(`Object saved to ${saveTarget.path} (${bytes} bytes)`);
         }
 
