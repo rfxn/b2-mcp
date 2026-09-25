@@ -474,7 +474,10 @@ async function assertCommitStillMatchesVetting(
 
 async function writeFully(handle: fs.promises.FileHandle, chunk: Buffer): Promise<void> {
   for (let offset = 0; offset < chunk.byteLength; ) {
-    offset += (await handle.write(chunk, offset)).bytesWritten;
+    const { bytesWritten } = await handle.write(chunk, offset);
+    // A 0-byte write would otherwise be retried until the idle timeout.
+    if (bytesWritten === 0) throw new Error("saveToPath temp file write made no progress.");
+    offset += bytesWritten;
   }
 }
 

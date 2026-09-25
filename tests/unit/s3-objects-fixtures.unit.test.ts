@@ -747,6 +747,39 @@ describe("S3 object tools with deterministic handler fake", () => {
     }
   });
 
+  it("fails a temp file write that makes no progress instead of retrying it", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-stuck-"));
+    const target = path.join(dir, "out.txt");
+    fs.writeFileSync(target, "KEEP\n");
+    let writes = 0;
+    const realOpen = fs.promises.open.bind(fs.promises);
+    const openSpy = vi.spyOn(fs.promises, "open").mockImplementation(async (...args) => {
+      const handle = await realOpen(...(args as Parameters<typeof realOpen>));
+      if (String(args[0]).endsWith(".part")) {
+        handle.write = (async (buffer: Buffer) => {
+          writes += 1;
+          await new Promise((resolve) => setImmediate(resolve));
+          return { bytesWritten: 0, buffer };
+        }) as typeof handle.write;
+      }
+      return handle;
+    });
+    queueWebBody("NEW");
+
+    try {
+      const result = await saveTo(target);
+
+      expect(result.isError).toBe(true);
+      expect(parseResult(result)).toMatch(/write made no progress/);
+      expect(writes).toBe(1);
+      expect(fs.readFileSync(target, "utf8")).toBe("KEEP\n");
+      expect(fs.readdirSync(dir)).toEqual(["out.txt"]);
+    } finally {
+      openSpy.mockRestore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("keeps the existing file when the body ends before its content length", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-short-"));
     const target = path.join(dir, "out.txt");
