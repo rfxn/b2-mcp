@@ -189,6 +189,8 @@ async function pipelineBodyToFileWithIdleTimeout(
   }
 }
 
+const ignoreError = (): undefined => undefined;
+
 interface SaveToPathTarget {
   path: string;
   existing: { mode: number; uid: number; gid: number; dev: number; ino: number } | undefined;
@@ -262,10 +264,10 @@ async function preserveOwnership(
   try {
     await handle.chown(existing.uid, existing.gid);
   } catch {
-    await handle.chown(-1, existing.gid).catch(() => undefined);
+    await handle.chown(-1, existing.gid).catch(ignoreError);
   }
   // Read back: some mounts ignore chown without failing.
-  const after = await handle.stat().catch(() => undefined);
+  const after = await handle.stat().catch(ignoreError);
   return { uid: after?.uid === existing.uid, gid: after?.gid === existing.gid };
 }
 
@@ -288,7 +290,7 @@ async function assertOpenedInsideFileRoot(
 ): Promise<void> {
   let openedPath: string | undefined;
   if (process.platform === "linux") {
-    openedPath = await fs.promises.readlink(`/proc/self/fd/${handle.fd}`).catch(() => undefined);
+    openedPath = await fs.promises.readlink(`/proc/self/fd/${handle.fd}`).catch(ignoreError);
   }
   if (openedPath === undefined) {
     const opened = await handle.stat();
@@ -299,7 +301,7 @@ async function assertOpenedInsideFileRoot(
     } catch {
       realPath = undefined;
     }
-    const onDisk = realPath ? await fs.promises.stat(realPath).catch(() => undefined) : undefined;
+    const onDisk = realPath ? await fs.promises.stat(realPath).catch(ignoreError) : undefined;
     // A second link could name the same file outside the root.
     if (onDisk?.dev === opened.dev && onDisk.ino === opened.ino && opened.nlink === 1)
       openedPath = realPath;
@@ -325,7 +327,7 @@ const PIN_DIR_FLAGS = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY;
 // Re-read on every use: a pinned directory can be moved out of the root.
 async function pinnedDirInsideRoot(dirFd: number, sandbox?: B2Config): Promise<boolean> {
   if (!sandbox) return true;
-  const realDir = await fs.promises.readlink(`/proc/self/fd/${dirFd}`).catch(() => undefined);
+  const realDir = await fs.promises.readlink(`/proc/self/fd/${dirFd}`).catch(ignoreError);
   return realDir !== undefined && isInsideFileRoot(sandbox, realDir);
 }
 
@@ -346,9 +348,7 @@ async function pinParentDir(
   const changed = refusal(
     `The saveToPath directory '${dir}' changed while the download was being prepared.`,
   );
-  if (
-    (await fs.promises.readlink(`/proc/self/fd/${handle.fd}`).catch(() => undefined)) === undefined
-  ) {
+  if ((await fs.promises.readlink(`/proc/self/fd/${handle.fd}`).catch(ignoreError)) === undefined) {
     // A sandboxed request fails rather than falling back to path-based operations.
     return sandbox
       ? refusal(
@@ -368,7 +368,7 @@ async function pinParentDir(
     );
   }
   const refuse = async (result: ParentPin): Promise<ParentPin> => {
-    await dirHandle.close().catch(() => undefined);
+    await dirHandle.close().catch(ignoreError);
     return result;
   };
   try {
@@ -424,7 +424,7 @@ async function makeParentDirs(dir: string, createdDirs: CreatedDir[]): Promise<v
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
       continue;
     }
-    const made = await fs.promises.lstat(level).catch(() => undefined);
+    const made = await fs.promises.lstat(level).catch(ignoreError);
     if (made) createdDirs.push({ path: level, dev: made.dev, ino: made.ino });
   }
 }
@@ -436,9 +436,9 @@ async function removeCreatedDirs(
   // Kept under a file root: a swapped or moved ancestor could aim the removal outside it.
   if (sandbox) return;
   for (const created of [...createdDirs].reverse()) {
-    const onDisk = await fs.promises.lstat(created.path).catch(() => undefined);
+    const onDisk = await fs.promises.lstat(created.path).catch(ignoreError);
     if (!onDisk?.isDirectory() || onDisk.dev !== created.dev || onDisk.ino !== created.ino) return;
-    await fs.promises.rmdir(created.path).catch(() => undefined);
+    await fs.promises.rmdir(created.path).catch(ignoreError);
   }
 }
 
@@ -452,7 +452,7 @@ async function assertCommitStillMatchesVetting(
 ): Promise<void> {
   const dir = path.dirname(tempPath);
   const at = (name: string) => (anchor ? atDirFd(anchor.handle.fd, name) : path.join(dir, name));
-  const temp = await fs.promises.lstat(at(tempName)).catch(() => undefined);
+  const temp = await fs.promises.lstat(at(tempName)).catch(ignoreError);
   if (temp?.dev !== tempId.dev || temp.ino !== tempId.ino) {
     throw badRequestError(
       `The saveToPath temp file was replaced while the download was in flight; '${target.path}' was left unchanged.`,
@@ -461,7 +461,7 @@ async function assertCommitStillMatchesVetting(
   const was = target.existing;
   const name = at(path.basename(target.path));
   // lstat catches a link swapped in for a vetted file; stat keeps a dangling link absent.
-  const now = await (was ? fs.promises.lstat(name) : fs.promises.stat(name)).catch(() => undefined);
+  const now = await (was ? fs.promises.lstat(name) : fs.promises.stat(name)).catch(ignoreError);
   const unchanged = was
     ? now?.dev === was.dev &&
       now.ino === was.ino &&
@@ -530,7 +530,7 @@ async function downloadToPath(
     if (target.existing) {
       const kept = await preserveOwnership(handle, target.existing);
       // Best effort: FAT and SMB mounts may refuse fchmod.
-      await handle.chmod(modeCarriedSafely(target.existing.mode, kept)).catch(() => undefined);
+      await handle.chmod(modeCarriedSafely(target.existing.mode, kept)).catch(ignoreError);
     }
     const object = await fetchObject();
     body = object.body;
@@ -583,15 +583,15 @@ async function downloadToPath(
     // Unlinked while the handle is still open, so the temp file keeps its identity.
     if (!committed) {
       const temp = anchor ? atDirFd(anchor.handle.fd, tempName) : tempPath;
-      const entry = await fs.promises.lstat(temp).catch(() => undefined);
+      const entry = await fs.promises.lstat(temp).catch(ignoreError);
       if (entry && entry.dev === tempId?.dev && entry.ino === tempId.ino) {
-        await fs.promises.unlink(temp).catch(() => undefined);
+        await fs.promises.unlink(temp).catch(ignoreError);
       }
     }
     writeStream?.destroy();
-    await handle.close().catch(() => undefined);
+    await handle.close().catch(ignoreError);
     if (!committed && cleanupIsSafe) await removeCreatedDirs(createdDirs, sandbox);
-    await anchor?.handle.close().catch(() => undefined);
+    await anchor?.handle.close().catch(ignoreError);
   }
 }
 
