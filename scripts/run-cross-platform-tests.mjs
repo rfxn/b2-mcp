@@ -9,6 +9,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const testFiles = [
   "tests/unit/fs-guard.unit.test.ts",
   "tests/unit/s3-objects-fixtures.unit.test.ts",
+  "tests/unit/probe-win.unit.test.ts",
   "tests/unit/http-server.unit.test.ts",
   "tests/unit/http-transport.unit.test.ts",
   "tests/contract/tools-schema.contract.test.ts",
