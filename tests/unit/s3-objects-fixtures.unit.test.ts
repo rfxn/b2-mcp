@@ -870,9 +870,10 @@ describe("S3 object tools with deterministic handler fake", () => {
       { mode: 0o266, keepUid: false, expected: 0o222 },
       // A refused fchmod keeps the owner-only mode the temp file was created with.
       { mode: 0o640, keepUid: true, expected: 0o600, refuseChmod: true },
-      // With the group kept, only the replaced owner changes class, so group access stays.
+      // With the group kept, only the old owner moves into group or other, so both are capped at its bits.
       { mode: 0o660, keepGid: true, expected: 0o660 },
       { mode: 0o674, keepGid: true, expected: 0o664 },
+      { mode: 0o607, keepGid: true, expected: 0o606 },
     ];
 
     for (const { mode, keepUid = false, keepGid = false, expected, refuseChmod } of cases) {
