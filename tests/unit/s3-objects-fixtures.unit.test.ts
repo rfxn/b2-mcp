@@ -774,7 +774,7 @@ describe("S3 object tools with deterministic handler fake", () => {
   });
 
   // Only root can make a file owned by someone else, so the vetted owner is faked by inode.
-  posixIt("carries the replaced file's owner and group, falling back to the group", async () => {
+  posixIt("tries the replaced file's owner and group, then the group alone", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-chown-"));
     const target = path.join(dir, "owned.txt");
     fs.writeFileSync(target, "OLD\n");
@@ -837,9 +837,12 @@ describe("S3 object tools with deterministic handler fake", () => {
       { mode: 0o266, keepUid: false, expected: 0o222 },
       // A refused fchmod keeps the owner-only mode the temp file was created with.
       { mode: 0o640, keepUid: true, expected: 0o600, refuseChmod: true },
+      // With the group kept, only the replaced owner changes class, so group access stays.
+      { mode: 0o660, keepGid: true, expected: 0o660 },
+      { mode: 0o674, keepGid: true, expected: 0o664 },
     ];
 
-    for (const { mode, keepUid, expected, refuseChmod } of cases) {
+    for (const { mode, keepUid = false, keepGid = false, expected, refuseChmod } of cases) {
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-clamp-"));
       const target = path.join(dir, "owned.txt");
       fs.writeFileSync(target, "OLD\n");
@@ -856,7 +859,7 @@ describe("S3 object tools with deterministic handler fake", () => {
         const realStat = handle.stat.bind(handle);
         handle.stat = (async () => {
           const stat = await realStat();
-          Object.defineProperty(stat, "gid", { value: stat.gid + 1 });
+          if (!keepGid) Object.defineProperty(stat, "gid", { value: stat.gid + 1 });
           if (!keepUid) Object.defineProperty(stat, "uid", { value: stat.uid + 1 });
           return stat;
         }) as typeof handle.stat;
@@ -1051,39 +1054,6 @@ describe("S3 object tools with deterministic handler fake", () => {
     }
   });
 
-  linuxIt(
-    "keeps a directory outside the root when cleanup follows a swapped ancestor",
-    async () => {
-      const root = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-clean-root-"));
-      const outside = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-clean-out-"));
-      const shared = path.join(root, "shared");
-      fs.mkdirSync(shared);
-      // An empty directory outside the root, of the kind a failed cleanup would remove.
-      const bystander = path.join(outside, "lock");
-      fs.mkdirSync(bystander);
-      const target = path.join(shared, "x", "lock", "out.txt");
-      const sandboxed = sandboxedTools(root);
-      s3.respond("getObject", () => {
-        fs.renameSync(path.join(shared, "x"), path.join(shared, "x.stash"));
-        fs.symlinkSync(outside, path.join(shared, "x"));
-        throw notFound();
-      });
-
-      try {
-        const result = await saveTo(target, { harness: sandboxed, key: "missing.txt" });
-
-        expect(result.isError).toBe(true);
-        expect(fs.existsSync(bystander)).toBe(true);
-        expect(fs.readdirSync(outside)).toEqual(["lock"]);
-        // The levels this download really created are gone.
-        expect(fs.readdirSync(path.join(shared, "x.stash"))).toEqual([]);
-      } finally {
-        fs.rmSync(root, { recursive: true, force: true });
-        fs.rmSync(outside, { recursive: true, force: true });
-      }
-    },
-  );
-
   // Swapped between opening the temp file and pinning its directory. With nothing in its
   // place the stat through the pin fails; a decoy of the temp name leaves the inode check.
   for (const decoy of [false, true]) {
@@ -1194,38 +1164,12 @@ describe("S3 object tools with deterministic handler fake", () => {
     }
   });
 
-  linuxIt("does not remove a created directory that was moved out of the root", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-away-root-"));
-    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-away-out-"));
+  it("leaves an empty same-named directory left in place of one it created", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-decoy-"));
     const shared = path.join(root, "shared");
     fs.mkdirSync(shared);
     const level = path.join(shared, "x");
     const target = path.join(level, "out.txt");
-    const sandboxed = sandboxedTools(root);
-    s3.respond("getObject", () => {
-      fs.renameSync(level, path.join(outside, "x"));
-      throw notFound();
-    });
-
-    try {
-      const result = await saveTo(target, { harness: sandboxed, key: "missing.txt" });
-
-      expect(result.isError).toBe(true);
-      // Still this download's own directory, but no longer somewhere it may act.
-      expect(fs.existsSync(path.join(outside, "x"))).toBe(true);
-    } finally {
-      fs.rmSync(root, { recursive: true, force: true });
-      fs.rmSync(outside, { recursive: true, force: true });
-    }
-  });
-
-  linuxIt("leaves an empty same-named directory left in place of one it created", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-decoy-"));
-    const shared = path.join(root, "shared");
-    fs.mkdirSync(shared);
-    const level = path.join(shared, "x");
-    const target = path.join(level, "out.txt");
-    const sandboxed = sandboxedTools(root);
     // The created level is moved aside and an empty decoy left under its name, so only
     // an inode check can tell that the name no longer holds what this download made.
     s3.respond("getObject", () => {
@@ -1235,7 +1179,7 @@ describe("S3 object tools with deterministic handler fake", () => {
     });
 
     try {
-      const result = await saveTo(target, { harness: sandboxed, key: "missing.txt" });
+      const result = await saveTo(target, { key: "missing.txt" });
 
       expect(result.isError).toBe(true);
       expect(fs.existsSync(level)).toBe(true);
@@ -1244,13 +1188,9 @@ describe("S3 object tools with deterministic handler fake", () => {
     }
   });
 
-  // Without a pin (no /proc, or not Linux) the cleanup falls back to paths, so a level
-  // is removed only while it is still the inode that was created.
-  posixIt("keeps the directories it created under a file root without a pin", async () => {
+  it("keeps the directories it created under a file root", async () => {
     const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-pin-off-")));
     const sandboxed = sandboxedTools(root);
-    const realPlatform = process.platform;
-    Object.defineProperty(process, "platform", { value: "darwin" });
     s3.respond("getObject", () => {
       throw notFound();
     });
@@ -1264,7 +1204,6 @@ describe("S3 object tools with deterministic handler fake", () => {
       expect(result.isError).toBe(true);
       expect(fs.readdirSync(path.join(root, "a", "b"))).toEqual([]);
     } finally {
-      Object.defineProperty(process, "platform", { value: realPlatform });
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
@@ -1309,31 +1248,54 @@ describe("S3 object tools with deterministic handler fake", () => {
     );
   }
 
-  for (const op of ["rename", "unlink"] as const) {
-    it(`keeps the temp file open until it is ${op === "rename" ? "renamed" : "removed"}`, async () => {
+  const heldCases = [
+    { name: "renamed", op: "rename", body: () => streamFrom([new TextEncoder().encode("NEW")]) },
+    // Ends cleanly but short of its length, so the save fails after the write.
+    {
+      name: "removed after a short body",
+      op: "unlink",
+      contentLength: 10,
+      body: () => streamFrom([new TextEncoder().encode("NEW")]),
+    },
+    // Fails mid-stream, so the transfer tears its streams down before cleanup.
+    {
+      name: "removed after a body error",
+      op: "unlink",
+      body: () =>
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("NE"));
+            controller.error(Object.assign(new Error("reset"), { code: "ECONNRESET" }));
+          },
+        }) as unknown as B2S3DownloadedObject["body"],
+    },
+  ] as const;
+  for (const held of heldCases) {
+    it(`keeps the temp file open until it is ${held.name}`, async () => {
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), "b2-save-held-"));
       const target = path.join(dir, "out.txt");
       fs.writeFileSync(target, "OLD\n");
       const opened = trackOpenedHandles();
       let heldAtOp: boolean | undefined;
-      const real = fs.promises[op].bind(fs.promises) as (...args: string[]) => Promise<void>;
-      const opSpy = vi.spyOn(fs.promises, op as "rename").mockImplementation(async (...args) => {
-        const temp = opened.handles[opened.paths.findIndex((name) => name.endsWith(".part"))];
-        heldAtOp = temp !== undefined && temp.fd !== -1;
-        return real(...(args as string[]));
-      });
-      // A body short of its length makes the save fail and remove its temp file.
+      const real = fs.promises[held.op].bind(fs.promises) as (...args: string[]) => Promise<void>;
+      const opSpy = vi
+        .spyOn(fs.promises, held.op as "rename")
+        .mockImplementation(async (...args) => {
+          const temp = opened.handles[opened.paths.findIndex((name) => name.endsWith(".part"))];
+          heldAtOp = temp !== undefined && temp.fd !== -1;
+          return real(...(args as string[]));
+        });
       s3.respond("getObject", () =>
         downloadedObject({
-          contentLength: op === "rename" ? 3 : 10,
-          body: streamFrom([new TextEncoder().encode("NEW")]),
+          contentLength: "contentLength" in held ? held.contentLength : 3,
+          body: held.body(),
         }),
       );
 
       try {
         const result = await saveTo(target);
 
-        expect(Boolean(result.isError)).toBe(op === "unlink");
+        expect(Boolean(result.isError)).toBe(held.op === "unlink");
         expect(heldAtOp).toBe(true);
         expect(opened.handles.every((handle) => handle.fd === -1)).toBe(true);
         expect(fs.readdirSync(dir)).toEqual(["out.txt"]);

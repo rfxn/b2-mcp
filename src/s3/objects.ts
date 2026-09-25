@@ -8,7 +8,7 @@ import type { ReadableStream as WebReadableStream } from "node:stream/web";
 import { randomBytes } from "crypto";
 import * as fs from "fs";
 import * as path from "path";
-import { Readable, Transform } from "stream";
+import { Readable, Transform, Writable } from "stream";
 import { pipeline } from "stream/promises";
 import { z } from "zod";
 import type { ToolRegistrar } from "../mcp.js";
@@ -141,7 +141,7 @@ function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
 
 async function pipelineBodyToFileWithIdleTimeout(
   body: B2S3ObjectBody,
-  writeStream: fs.WriteStream,
+  writeStream: Writable,
 ): Promise<number> {
   const source = nodeReadableFromBody(body);
   const timeoutMs = saveToPathIdleTimeoutMs();
@@ -275,6 +275,7 @@ function modeCarriedSafely(mode: number, kept: { uid: boolean; gid: boolean }): 
   const owner = (mode >> 6) & 0o7;
   const group = (mode >> 3) & 0o7;
   const other = mode & 0o7;
+  if (kept.gid) return (owner << 6) | ((group & owner) << 3) | (other & owner);
   const shared = kept.uid ? group & other : owner & group & other;
   return (owner << 6) | (shared << 3) | shared;
 }
@@ -312,7 +313,6 @@ async function assertOpenedInsideFileRoot(
 
 interface CommitAnchor {
   handle: fs.promises.FileHandle;
-  dir: string;
 }
 
 function atDirFd(dirFd: number, name: string): string {
@@ -427,39 +427,14 @@ async function makeParentDirs(dir: string, createdDirs: CreatedDir[]): Promise<v
 
 async function removeCreatedDirs(
   createdDirs: readonly CreatedDir[],
-  anchor?: CommitAnchor,
   sandbox?: B2Config,
 ): Promise<void> {
-  const deepestFirst = [...createdDirs].reverse();
-  if (!anchor || deepestFirst[0]?.path !== anchor.dir) {
-    // A path-based removal can be redirected by a swapped ancestor, so a sandbox keeps them.
-    if (sandbox) return;
-    for (const created of deepestFirst) {
-      const onDisk = await fs.promises.lstat(created.path).catch(() => undefined);
-      if (!onDisk?.isDirectory() || onDisk.dev !== created.dev || onDisk.ino !== created.ino)
-        return;
-      await fs.promises.rmdir(created.path).catch(() => undefined);
-    }
-    return;
-  }
-  const parents: fs.promises.FileHandle[] = [];
-  try {
-    let child = anchor.handle;
-    for (const created of deepestFirst) {
-      // `..` follows a moved directory, so each parent is checked against the root.
-      const parent = await fs.promises.open(atDirFd(child.fd, ".."), PIN_DIR_FLAGS);
-      parents.push(parent);
-      if (!(await pinnedDirInsideRoot(parent.fd, sandbox))) return;
-      const name = atDirFd(parent.fd, path.basename(created.path));
-      const onDisk = await fs.promises.lstat(name).catch(() => undefined);
-      if (onDisk?.dev !== created.dev || onDisk.ino !== created.ino) return;
-      await fs.promises.rmdir(name).catch(() => undefined);
-      child = parent;
-    }
-  } catch {
-    // A level that cannot be reopened stops the walk; what remains is empty.
-  } finally {
-    for (const parent of parents) await parent.close().catch(() => undefined);
+  // Kept under a file root: a swapped or moved ancestor could aim the removal outside it.
+  if (sandbox) return;
+  for (const created of [...createdDirs].reverse()) {
+    const onDisk = await fs.promises.lstat(created.path).catch(() => undefined);
+    if (!onDisk?.isDirectory() || onDisk.dev !== created.dev || onDisk.ino !== created.ino) return;
+    await fs.promises.rmdir(created.path).catch(() => undefined);
   }
 }
 
@@ -497,6 +472,12 @@ async function assertCommitStillMatchesVetting(
   }
 }
 
+async function writeFully(handle: fs.promises.FileHandle, chunk: Buffer): Promise<void> {
+  for (let offset = 0; offset < chunk.byteLength; ) {
+    offset += (await handle.write(chunk, offset)).bytesWritten;
+  }
+}
+
 async function downloadToPath(
   target: SaveToPathTarget,
   fetchObject: () => Promise<B2S3DownloadedObject>,
@@ -519,13 +500,13 @@ async function downloadToPath(
       target.existing ? target.existing.mode & 0o700 : 0o666,
     );
   } catch (err) {
-    await removeCreatedDirs(createdDirs, undefined, sandbox);
+    await removeCreatedDirs(createdDirs, sandbox);
     if (err instanceof FileAccessError) throw badRequestError(err.message);
     throw notWritableError(err, `directory '${dir}'`);
   }
 
   let body: B2S3ObjectBody | undefined;
-  let writeStream: fs.WriteStream | undefined;
+  let writeStream: Writable | undefined;
   let committed = false;
   let anchor: CommitAnchor | undefined;
   // Until the opened file and its directory are confirmed, a swap could aim cleanup elsewhere.
@@ -536,7 +517,7 @@ async function downloadToPath(
     tempId = { dev: opened.dev, ino: opened.ino };
     if (sandbox) await assertOpenedInsideFileRoot(handle, tempPath, sandbox);
     const pin = await pinParentDir(dir, handle, tempName, sandbox);
-    if (pin.kind === "pinned") anchor = { handle: pin.handle, dir };
+    if (pin.kind === "pinned") anchor = { handle: pin.handle };
     if (pin.kind === "refused") throw badRequestError(pin.message);
     cleanupIsSafe = true;
     if (target.existing) {
@@ -547,8 +528,12 @@ async function downloadToPath(
     const object = await fetchObject();
     body = object.body;
     const bytes = await withS3LongCircuit(async () => {
-      // Held open through the commit, so the temp inode is not evicted or its number reused.
-      const stream = handle.createWriteStream({ autoClose: false });
+      // Not createWriteStream, whose destroy() closes the handle: it stays open until cleanup.
+      const stream = new Writable({
+        write(chunk: Buffer, _encoding, callback) {
+          writeFully(handle, chunk).then(() => callback(), callback);
+        },
+      });
       writeStream = stream;
       const written = await withBodyReadAbort(object.body, () =>
         pipelineBodyToFileWithIdleTimeout(object.body, stream),
@@ -588,7 +573,7 @@ async function downloadToPath(
     if (err instanceof FileAccessError) throw badRequestError(err.message);
     throw err;
   } finally {
-    // Before destroy(), which closes the handle: an open temp file keeps its identity.
+    // Unlinked while the handle is still open, so the temp file keeps its identity.
     if (!committed) {
       const temp = anchor ? atDirFd(anchor.handle.fd, tempName) : tempPath;
       const entry = await fs.promises.lstat(temp).catch(() => undefined);
@@ -598,7 +583,7 @@ async function downloadToPath(
     }
     writeStream?.destroy();
     await handle.close().catch(() => undefined);
-    if (!committed && cleanupIsSafe) await removeCreatedDirs(createdDirs, anchor, sandbox);
+    if (!committed && cleanupIsSafe) await removeCreatedDirs(createdDirs, sandbox);
     await anchor?.handle.close().catch(() => undefined);
   }
 }
