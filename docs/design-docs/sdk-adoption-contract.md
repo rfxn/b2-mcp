@@ -64,12 +64,12 @@ through the SDK `/s3` helper.
 Issue [#344](https://github.com/backblaze-labs/b2-mcp/issues/344) requires
 `@backblaze-labs/b2-sdk@0.4.0`, and that exact npm version was published at
 `2026-09-01T18:50:49.255Z`, inside the repository minimum-release-age window at
-the time of adoption. The root and customer-hosted workspaces carry a temporary
+the time of adoption. The root and customer-hosted workspaces carried a temporary
 exact-version `minimumReleaseAgeExclude` entry for
-`@backblaze-labs/b2-sdk@0.4.0` so frozen installs can verify the reviewed
-lockfile while the cooldown elapses. The exception expires at
-`2026-09-16T19:00:00.000Z`; after that timestamp, the supply-chain policy test
-fails until the exclusion is removed from both workspaces. Future SDK bumps must
+`@backblaze-labs/b2-sdk@0.4.0` so frozen installs could verify the reviewed
+lockfile while the cooldown elapsed. The exception expired at
+`2026-09-16T19:00:00.000Z`, and the exclusion has been removed from both
+workspaces. Future SDK bumps must
 either wait out the release-age window or add a new reviewed, time-bounded
 exception.
 
